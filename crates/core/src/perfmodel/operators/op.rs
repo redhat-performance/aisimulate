@@ -19,6 +19,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::common::error::AicError;
+use crate::operators::glm5_next::{
+    Glm5NextFp32LinearOp, Glm5NextKdaOp, Glm5NextMhcOp, Glm5NextSparseAttentionOp,
+};
 use crate::operators::{
     ContextAttentionOp, ContextMlaOp, CustomAllReduceOp, DsaModuleOp, Dsv4MegaMoeOp, Dsv4ModuleOp,
     Dsv41AttentionOp, Dsv41EngramOp, Dsv41LinearOp, Dsv41MhcOp, Dsv41StageOp, ElementwiseOp,
@@ -183,6 +186,11 @@ pub enum Op {
     Dsv41Engram(Dsv41EngramOp),
     Dsv41Stage(Dsv41StageOp),
     Dsv41Linear(Dsv41LinearOp),
+    // Append-only: preserve every pre-existing bincode variant index.
+    Glm5NextSparseAttention(Glm5NextSparseAttentionOp),
+    Glm5NextMhc(Glm5NextMhcOp),
+    Glm5NextKda(Glm5NextKdaOp),
+    Glm5NextFp32Linear(Glm5NextFp32LinearOp),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -272,6 +280,9 @@ impl Op {
     /// family multiplies its own scale_factor inside its `weight_bytes`.
     pub fn weight_bytes(&self) -> f64 {
         match self {
+            Op::Glm5NextMhc(o) => o.weight_bytes(),
+            Op::Glm5NextFp32Linear(o) => o.weight_bytes(),
+            Op::Glm5NextSparseAttention(_) | Op::Glm5NextKda(_) => 0.0,
             Op::Dsv41Attention(o) => o.weight_bytes(),
             Op::Dsv41Mhc(o) => o.weight_bytes(),
             Op::Dsv41Engram(o) => o.weight_bytes(),
@@ -332,6 +343,10 @@ impl Op {
     /// debugging.
     pub fn name(&self) -> &str {
         match self {
+            Op::Glm5NextSparseAttention(o) => &o.name,
+            Op::Glm5NextMhc(o) => &o.name,
+            Op::Glm5NextKda(o) => &o.name,
+            Op::Glm5NextFp32Linear(o) => &o.name,
             Op::Dsv41Attention(o) => &o.name,
             Op::Dsv41Mhc(o) => &o.name,
             Op::Dsv41Engram(o) => &o.name,
@@ -381,6 +396,10 @@ impl Op {
     /// returns them). Every variant carries `name`.
     pub fn set_name(&mut self, name: String) {
         match self {
+            Op::Glm5NextSparseAttention(o) => o.name = name,
+            Op::Glm5NextMhc(o) => o.name = name,
+            Op::Glm5NextKda(o) => o.name = name,
+            Op::Glm5NextFp32Linear(o) => o.name = name,
             Op::Dsv41Attention(o) => o.name = name,
             Op::Dsv41Mhc(o) => o.name = name,
             Op::Dsv41Engram(o) => o.name = name,
@@ -428,6 +447,10 @@ impl Op {
     /// Uniform repetition-count mutator for draft forwards.
     pub fn set_scale_factor(&mut self, scale_factor: f64) {
         match self {
+            Op::Glm5NextSparseAttention(o) => o.scale_factor = scale_factor,
+            Op::Glm5NextMhc(o) => o.scale_factor = scale_factor,
+            Op::Glm5NextKda(o) => o.scale_factor = scale_factor,
+            Op::Glm5NextFp32Linear(o) => o.scale_factor = scale_factor,
             Op::TokenScale(o) => o.op.set_scale_factor(scale_factor),
             Op::Gemm(o) => o.scale_factor = scale_factor,
             Op::Embedding(o) => o.scale_factor = scale_factor,
@@ -528,6 +551,10 @@ impl Op {
         ctx: &RuntimeContext,
     ) -> Result<PerformanceResult, AicError> {
         match self {
+            Op::Glm5NextSparseAttention(op) => op.query(db, ctx),
+            Op::Glm5NextMhc(op) => op.query(db, ctx.num_tokens),
+            Op::Glm5NextKda(op) => op.query(db, ctx),
+            Op::Glm5NextFp32Linear(op) => op.query(db, ctx.num_tokens),
             Op::Dsv41Attention(op) => op.query(db, ctx),
             Op::Dsv41Mhc(op) => op.query(db, ctx.num_tokens),
             Op::Dsv41Engram(op) => op.query(db, ctx.num_tokens),

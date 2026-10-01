@@ -36,6 +36,7 @@ _MOE_MODEL_FAMILIES = {
     "DEEPSEEKV41",
     "KIMIK25",
     "KIMIK3",
+    "GLM5NEXT",
     "HYBRIDMOE",
     "QWEN3VL_MOE",
     "GEMMA4MIX",
@@ -668,6 +669,14 @@ def _infer_quant_modes_from_raw_config(raw_config: dict, architecture: str | Non
         overrides["fmha_quant_mode"] = common.FMHAQuantMode.fp8
         if kv_cache_algo is None or kv_cache_algo != "fp8":
             overrides["kvcache_quant_mode"] = common.KVCacheQuantMode.fp8
+
+    # GLM5NEXT's initial vLLM contract is BF16 NoPE MLA/KDA, including on
+    # Hopper. FP8 describes FFN weights, not the attention/cache precision.
+    # Explicit overrides still win in _apply_model_quant_defaults and are
+    # validated by the model rather than silently rewritten.
+    if architecture == "Glm5NextForConditionalGeneration":
+        overrides["kvcache_quant_mode"] = common.KVCacheQuantMode.bfloat16
+        overrides["fmha_quant_mode"] = common.FMHAQuantMode.bfloat16
 
     return overrides
 

@@ -400,6 +400,39 @@ class KimiK3Config:
 
 
 @dataclass(frozen=True)
+class Glm5NextConfig:
+    """GLM-5.3-Flash text backbone: KDA + NoPE sparse MLA, MoE and mHC.
+
+    Layer plans are zero-based tuples. Vision metadata remains in raw_config;
+    this contract does not enable multimodal inference or certify accuracy.
+    """
+
+    layer_types: tuple[str, ...]
+    mlp_layer_types: tuple[str, ...]
+    kda_num_heads: int
+    kda_head_dim: int
+    kda_conv_kernel: int
+    q_lora_rank: int
+    kv_lora_rank: int
+    qk_nope_head_dim: int
+    qk_rope_head_dim: int
+    v_head_dim: int
+    index_head_dim: int
+    index_n_heads: int
+    index_topk: int
+    index_kpool: int
+    hc_mult: int
+    hc_sinkhorn_iters: int
+    hc_eps: float
+    topk: int
+    num_experts: int
+    moe_inter_size: int
+    num_shared_experts: int
+    first_k_dense_replace: int
+    dense_inter_size: int
+
+
+@dataclass(frozen=True)
 class DeepSeekV4Config:
     """Config fields unique to DeepSeek-V4 compressed attention + mHC models."""
 
@@ -690,6 +723,8 @@ DefaultHFModels = {
     "zai-org/GLM-5.3",
     "zai-org/GLM-5.3-FP8",
     "nvidia/GLM-5.3-NVFP4",
+    # GLM-5.3-Flash is a distinct hybrid architecture, natively FP8.
+    "zai-org/GLM-5.3-Flash",
     # DeepSeek V4
     *DEEPSEEK_V4_HF_MODELS,
     # Qwen 3 Models
@@ -817,6 +852,7 @@ ModelFamily = {
     "DEEPSEEKV41",
     "KIMIK25",
     "KIMIK3",
+    "GLM5NEXT",
     "NEMOTRONNAS",
     "NEMOTRONH",
     "HYBRIDMOE",
@@ -839,6 +875,7 @@ ARCHITECTURE_TO_MODEL_FAMILY = {
     "DeepseekV3ForCausalLM": "DEEPSEEK",
     "DeepseekV32ForCausalLM": "DEEPSEEKV32",
     "GlmMoeDsaForCausalLM": "DEEPSEEKV32",
+    "Glm5NextForConditionalGeneration": "GLM5NEXT",
     "DeepseekV4ForCausalLM": "DEEPSEEKV4",
     "DeepseekV41ForCausalLM": "DEEPSEEKV41",
     "KimiK25ForConditionalGeneration": "KIMIK25",
@@ -875,6 +912,7 @@ ARCHITECTURE_TO_MODEL_FAMILY = {
 # Multimodal architectures whose LLM config lives under a nested key (e.g. "text_config").
 # _parse_hf_config_json will flatten these before parsing.
 MULTIMODAL_TEXT_CONFIG_KEY = {
+    "Glm5NextForConditionalGeneration": "text_config",
     "DeepseekV41ForCausalLM": "text_config",
     "KimiK25ForConditionalGeneration": "text_config",
     "KimiK3ForConditionalGeneration": "text_config",

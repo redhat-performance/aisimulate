@@ -121,6 +121,22 @@ impl Availability<'_> {
             DatabaseMode::Sol | DatabaseMode::SolFull
         );
         match op {
+            Glm5NextSparseAttention(o) => {
+                o.validate()?;
+                return crate::operators::glm5_next::mode_ready(self.db.database_mode);
+            }
+            Glm5NextMhc(o) => {
+                o.validate()?;
+                return crate::operators::glm5_next::mode_ready(self.db.database_mode);
+            }
+            Glm5NextKda(o) => {
+                o.validate()?;
+                return crate::operators::glm5_next::mode_ready(self.db.database_mode);
+            }
+            Glm5NextFp32Linear(o) => {
+                o.validate()?;
+                return crate::operators::glm5_next::mode_ready(self.db.database_mode);
+            }
             Dsv41Stage(stage) => {
                 for child in &stage.children {
                     self.op(child)?;
@@ -321,7 +337,15 @@ impl Availability<'_> {
                     _ => Ok(()),
                 }
             }
-            Overlap(_) | Fallback(_) | TokenScale(_) | FpmForward(_) | Dsv41Stage(_) => Ok(()),
+            Overlap(_)
+            | Fallback(_)
+            | TokenScale(_)
+            | FpmForward(_)
+            | Dsv41Stage(_)
+            | Glm5NextSparseAttention(_)
+            | Glm5NextMhc(_)
+            | Glm5NextKda(_)
+            | Glm5NextFp32Linear(_) => Ok(()),
         }
     }
 }

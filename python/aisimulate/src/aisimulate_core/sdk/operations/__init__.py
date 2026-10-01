@@ -43,6 +43,7 @@ from aisimulate_core.sdk.operations.elementwise import ElementWise
 from aisimulate_core.sdk.operations.embedding import Embedding
 from aisimulate_core.sdk.operations.fpm_forward import FPMForwardOp
 from aisimulate_core.sdk.operations.gemm import GEMM
+from aisimulate_core.sdk.operations.glm5_next import Glm5NextKDA, Glm5NextMHC, Glm5NextSparseAttention
 from aisimulate_core.sdk.operations.mamba import GDNKernel, KDAKernel, Mamba2Kernel
 from aisimulate_core.sdk.operations.mla import (
     ContextMLA,
@@ -89,6 +90,9 @@ __all__ = [
     "GenerationDeepSeekV4AttentionModule",
     "GenerationMLA",
     "GenerationMSAModule",
+    "Glm5NextKDA",
+    "Glm5NextMHC",
+    "Glm5NextSparseAttention",
     "KDAKernel",
     "MLABmm",
     "MLAModule",

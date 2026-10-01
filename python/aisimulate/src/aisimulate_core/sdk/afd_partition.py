@@ -29,6 +29,8 @@ class AFDPartitionError(ValueError):
 
 def validate_afd_model_architecture(architecture: str) -> None:
     """Reject architectures whose stages/residency cannot be split across A/F pools."""
+    if architecture == "Glm5NextForConditionalGeneration":
+        raise AFDPartitionError("AFD does not support GLM5NEXT hybrid state and mHC residency; use text TP estimation")
     if architecture == "DeepseekV41ForCausalLM":
         raise NotImplementedError(
             "AFD does not support DeepSeek-V4.1: mixed attention/FFN stages and "
@@ -72,6 +74,8 @@ def build_afd_ops_partition(
         unknown_side: Destination for unknown ops when ``allow_unknown_ops`` is true.
     """
 
+    if getattr(model, "model_family", None) == "GLM5NEXT":
+        validate_afd_model_architecture("Glm5NextForConditionalGeneration")
     model_phase = _validate_phase(phase)
     op_sequence = model.context_ops if model_phase == "context" else model.generation_ops
     partition = AFDOpsPartition(phase=model_phase)

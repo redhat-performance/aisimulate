@@ -46,6 +46,7 @@ use crate::common::enums::{
 };
 use crate::operators::attention::default_lane_order;
 use crate::operators::dsa::DsaProjectionQuants;
+use crate::operators::glm5_next::{Glm5NextKdaOp, Glm5NextMhcOp, Glm5NextSparseAttentionOp};
 use crate::operators::{
     ContextAttentionOp, ContextMlaOp, CustomAllReduceOp, ElementwiseOp, EmbeddingOp,
     EncoderAttentionOp, GemmOp, GenerationAttentionOp, GenerationMlaOp, MhcModuleOp, MlaBmmOp,
@@ -130,6 +131,26 @@ pub(crate) fn wrap_op(py: Python<'_>, op: Op) -> PyResult<Py<PyAny>> {
         }};
     }
     match &op {
+        Op::Glm5NextSparseAttention(o) => {
+            o.validate()
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            wrap!(PyGlm5NextSparseAttention)
+        }
+        Op::Glm5NextMhc(o) => {
+            o.validate()
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            wrap!(PyGlm5NextMHC)
+        }
+        Op::Glm5NextKda(o) => {
+            o.validate()
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            wrap!(PyGlm5NextKDA)
+        }
+        Op::Glm5NextFp32Linear(o) => {
+            o.validate()
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            Ok(Py::new(py, PyOperation { inner: op })?.into_any())
+        }
         Op::Gemm(_) => wrap!(PyGemm),
         Op::Embedding(_) => wrap!(PyEmbedding),
         Op::Elementwise(_) => wrap!(PyElementWise),
@@ -276,6 +297,27 @@ inner_accessor!(
 inner_accessor!(nccl, nccl_mut, Nccl, NcclOp, "NCCL");
 inner_accessor!(p2p, p2p_mut, P2P, P2POp, "P2P");
 inner_accessor!(mhc, mhc_mut, Mhc, MhcModuleOp, "DeepSeekV4MHCModule");
+inner_accessor!(
+    glm5_sparse,
+    glm5_sparse_mut,
+    Glm5NextSparseAttention,
+    Glm5NextSparseAttentionOp,
+    "Glm5NextSparseAttention"
+);
+inner_accessor!(
+    glm5_mhc,
+    glm5_mhc_mut,
+    Glm5NextMhc,
+    Glm5NextMhcOp,
+    "Glm5NextMHC"
+);
+inner_accessor!(
+    glm5_kda,
+    glm5_kda_mut,
+    Glm5NextKda,
+    Glm5NextKdaOp,
+    "Glm5NextKDA"
+);
 
 impl PyOperation {
     /// The MLA module struct regardless of phase variant.
@@ -4227,6 +4269,211 @@ impl PyFallbackOp {
     }
 }
 
+/// BF16, NoPE forced-MQA sparse core, without projection GEMMs or residency.
+#[pyclass(extends = PyOperation, subclass, name = "Glm5NextSparseAttention", module = "aisimulate_core._native")]
+pub struct PyGlm5NextSparseAttention;
+
+#[pymethods]
+impl PyGlm5NextSparseAttention {
+    #[classattr]
+    #[allow(non_upper_case_globals)]
+    const _ENGINE_QUERY_SHAPE: &'static str = "module";
+    #[classattr]
+    const _ESTIMATION_PROVENANCE: &'static str = "analytic_unvalidated";
+
+    #[new]
+    #[pyo3(signature = (name, num, is_context, num_heads, kv_lora_rank, qk_head_dim, v_head_dim, index_n_heads, index_head_dim, index_topk, index_kpool))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        name: String,
+        num: f64,
+        is_context: bool,
+        num_heads: u32,
+        kv_lora_rank: u32,
+        qk_head_dim: u32,
+        v_head_dim: u32,
+        index_n_heads: u32,
+        index_head_dim: u32,
+        index_topk: u32,
+        index_kpool: u32,
+    ) -> PyResult<(Self, PyOperation)> {
+        let o = Glm5NextSparseAttentionOp {
+            name,
+            scale_factor: num,
+            is_context,
+            num_heads,
+            kv_lora_rank,
+            qk_head_dim,
+            v_head_dim,
+            index_n_heads,
+            index_head_dim,
+            index_topk,
+            index_kpool,
+        };
+        o.validate()
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok((
+            Self,
+            PyOperation {
+                inner: Op::Glm5NextSparseAttention(o),
+            },
+        ))
+    }
+
+    fn __getnewargs_ex__<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyTuple>, Bound<'py, PyDict>)> {
+        let o = slf.as_super().glm5_sparse()?;
+        let args = (
+            o.name.clone(),
+            o.scale_factor,
+            o.is_context,
+            o.num_heads,
+            o.kv_lora_rank,
+            o.qk_head_dim,
+            o.v_head_dim,
+            o.index_n_heads,
+            o.index_head_dim,
+            o.index_topk,
+            o.index_kpool,
+        )
+            .into_pyobject(py)?;
+        Ok((args, PyDict::new(py)))
+    }
+
+    #[getter(_is_context)]
+    fn is_context(slf: PyRef<'_, Self>) -> PyResult<bool> {
+        Ok(slf.as_super().glm5_sparse()?.is_context)
+    }
+    #[getter(_num_heads)]
+    fn num_heads(slf: PyRef<'_, Self>) -> PyResult<u32> {
+        Ok(slf.as_super().glm5_sparse()?.num_heads)
+    }
+}
+
+/// One mHC site; includes its FP32 projection parameters exactly once.
+#[pyclass(extends = PyOperation, subclass, name = "Glm5NextMHC", module = "aisimulate_core._native")]
+pub struct PyGlm5NextMHC;
+
+#[pymethods]
+impl PyGlm5NextMHC {
+    #[classattr]
+    #[allow(non_upper_case_globals)]
+    const _ENGINE_QUERY_SHAPE: &'static str = "tokens";
+    #[classattr]
+    const _ESTIMATION_PROVENANCE: &'static str = "analytic_unvalidated";
+
+    #[new]
+    #[pyo3(signature = (name, num, hidden_size, hc_mult, hc_sinkhorn_iters))]
+    fn new(
+        name: String,
+        num: f64,
+        hidden_size: u32,
+        hc_mult: u32,
+        hc_sinkhorn_iters: u32,
+    ) -> PyResult<(Self, PyOperation)> {
+        let o = Glm5NextMhcOp {
+            name,
+            scale_factor: num,
+            hidden_size,
+            hc_mult,
+            hc_sinkhorn_iters,
+        };
+        o.validate()
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok((
+            Self,
+            PyOperation {
+                inner: Op::Glm5NextMhc(o),
+            },
+        ))
+    }
+
+    fn __getnewargs_ex__<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyTuple>, Bound<'py, PyDict>)> {
+        let o = slf.as_super().glm5_mhc()?;
+        let args = (
+            o.name.clone(),
+            o.scale_factor,
+            o.hidden_size,
+            o.hc_mult,
+            o.hc_sinkhorn_iters,
+        )
+            .into_pyobject(py)?;
+        Ok((args, PyDict::new(py)))
+    }
+}
+
+/// Packed conv, recurrence and output gated norm; no Kimi table selection.
+#[pyclass(extends = PyOperation, subclass, name = "Glm5NextKDA", module = "aisimulate_core._native")]
+pub struct PyGlm5NextKDA;
+
+#[pymethods]
+impl PyGlm5NextKDA {
+    #[classattr]
+    #[allow(non_upper_case_globals)]
+    const _ENGINE_QUERY_SHAPE: &'static str = "module";
+    #[classattr]
+    const _ESTIMATION_PROVENANCE: &'static str = "analytic_unvalidated";
+
+    #[new]
+    #[pyo3(signature = (name, num, is_context, num_heads, head_dim=128, conv_kernel=4))]
+    fn new(
+        name: String,
+        num: f64,
+        is_context: bool,
+        num_heads: u32,
+        head_dim: u32,
+        conv_kernel: u32,
+    ) -> PyResult<(Self, PyOperation)> {
+        let o = Glm5NextKdaOp {
+            name,
+            scale_factor: num,
+            is_context,
+            num_heads,
+            head_dim,
+            conv_kernel,
+        };
+        o.validate()
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok((
+            Self,
+            PyOperation {
+                inner: Op::Glm5NextKda(o),
+            },
+        ))
+    }
+
+    fn __getnewargs_ex__<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyTuple>, Bound<'py, PyDict>)> {
+        let o = slf.as_super().glm5_kda()?;
+        let args = (
+            o.name.clone(),
+            o.scale_factor,
+            o.is_context,
+            o.num_heads,
+            o.head_dim,
+            o.conv_kernel,
+        )
+            .into_pyobject(py)?;
+        Ok((args, PyDict::new(py)))
+    }
+
+    #[getter(_is_context)]
+    fn is_context(slf: PyRef<'_, Self>) -> PyResult<bool> {
+        Ok(slf.as_super().glm5_kda()?.is_context)
+    }
+    #[getter(_num_heads)]
+    fn num_heads(slf: PyRef<'_, Self>) -> PyResult<u32> {
+        Ok(slf.as_super().glm5_kda()?.num_heads)
+    }
+}
+
 /// Register every op class on the extension module.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyOperation>()?;
@@ -4262,6 +4509,9 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyP2P>()?;
     m.add_class::<PyOverlapOp>()?;
     m.add_class::<PyFallbackOp>()?;
+    m.add_class::<PyGlm5NextSparseAttention>()?;
+    m.add_class::<PyGlm5NextMHC>()?;
+    m.add_class::<PyGlm5NextKDA>()?;
     Ok(())
 }
 

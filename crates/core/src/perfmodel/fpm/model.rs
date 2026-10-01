@@ -530,8 +530,24 @@ impl ForwardPassPerfModel {
     /// count, and fallback warning.
     pub fn diagnostics(&self) -> ForwardPassPerfDiagnostics {
         match &self.mode {
-            ForwardPassPerfMode::Native { corrections, .. } => {
+            ForwardPassPerfMode::Native {
+                corrections,
+                engine,
+                ..
+            } => {
                 let ready_buckets = corrections.ready_bucket_count();
+                // An executable analytical graph is not measured support. Keep
+                // the native provenance visible through the canonical facade,
+                // without overwriting a pre-existing selection warning.
+                let last_warning = if engine.last_provenance() == Some("analytic_unvalidated") {
+                    let warning = "analytic_unvalidated: this estimate includes uncalibrated analytical operations; validate against target-hardware measurements";
+                    Some(match &self.last_warning {
+                        Some(prior) => format!("{prior}; {warning}"),
+                        None => warning.to_string(),
+                    })
+                } else {
+                    self.last_warning.clone()
+                };
                 ForwardPassPerfDiagnostics {
                     source: if ready_buckets > 0 {
                         ForwardPassPerfSource::AicWithCorrection
@@ -541,7 +557,7 @@ impl ForwardPassPerfModel {
                     readiness: ForwardPassPerfReadiness::Ready,
                     retained_observations: corrections.observation_count(),
                     correction_ready_buckets: ready_buckets,
-                    last_warning: self.last_warning.clone(),
+                    last_warning,
                     provenance: self.provenance.clone(),
                 }
             }

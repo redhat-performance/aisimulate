@@ -176,7 +176,9 @@ def _fpm_spec_dict(op: FPMForwardOp) -> dict:
 def _as_engine_op(op: Any) -> Operation:
     """Return the engine-backed form of ``op``.
 
-    Engine ops (Rust ``Operation`` subclasses) pass through, with a typed
+    Engine ops (Rust ``Operation`` subclasses, including Glm5NextSparseAttention,
+    Glm5NextMHC and Glm5NextKDA) pass through without Python geometry/timing math,
+    with a typed
     query-width wrapper for materialized draft ops. ``FPMForwardOp`` converts via its adapter dict +
     ``op_from_spec_json``. Anything else — the AFD orchestration ops, ad-hoc
     stand-ins — raises ``OpConversionError``, the established contract for
