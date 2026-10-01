@@ -1,4 +1,5 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # Modified: CPU-only model composition and memory inventory, not serving code.
 # Source: vllm-project/vllm@0a30bc3f9ac3cc1a9339e115377a99d32252aed0,
