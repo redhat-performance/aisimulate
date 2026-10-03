@@ -136,6 +136,8 @@ class ForwardPassPerfModelConfig:
     moe_backend: str | None = None
     enable_eplb: bool = False
     wideep_num_slots: int | None = None
+    execution_profile: str | None = dataclass_field(default=None, kw_only=True)
+    model_family: str | None = dataclass_field(default=None, kw_only=True)
 
     @classmethod
     def from_legacy_engine_config(
@@ -159,6 +161,10 @@ class ForwardPassPerfModelConfig:
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
+        if self.execution_profile is None:
+            payload.pop("execution_profile")
+        if self.model_family is None:
+            payload.pop("model_family")
         payload["transfer_policy"] = _resolve_forward_pass_transfer_policy(self.transfer_policy)
         if self.estimation_mode != "fpm_regression" or self.systems_paths:
             payload["systems_paths"] = _resolve_forward_pass_systems_paths(self.systems_paths)
@@ -1230,6 +1236,8 @@ def _engine_config_json(model: Any, database: Any) -> str:
                         "comm": _raw_quant_name(getattr(model_config, "comm_quant_mode", None)),
                     },
                     "model_config": {
+                        "execution_profile": getattr(model_config, "execution_profile", None),
+                        "language_only": getattr(model_config, "language_only", None),
                         "decoder_replay": bool(getattr(model_config, "decoder_replay", False)),
                         "cp_style": getattr(model_config, "cp_style", None),
                         "workload_distribution": getattr(model_config, "workload_distribution", None),

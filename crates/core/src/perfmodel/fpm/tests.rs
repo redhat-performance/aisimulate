@@ -435,7 +435,8 @@ fn forward_pass_prefill_matches_run_context_ops() {
 }
 
 /// A decode-only FPM through `forward_pass_time_ms` must equal the shared
-/// `run_generation_ops_step` free fn at the same (batch, kv_seq).
+/// `run_generation_ops_step` free fn at the same workload. Telemetry reports
+/// past KV; static generation includes the token currently being decoded.
 #[test]
 fn forward_pass_decode_matches_run_generation_ops_step() {
     let engine = fixture_engine();
@@ -452,7 +453,7 @@ fn forward_pass_decode_matches_run_generation_ops_step() {
         engine.generation_ops_for_test(),
         engine.database(),
         8,
-        2048,
+        2049,
         1.0,
         false,
     )

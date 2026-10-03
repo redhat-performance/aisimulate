@@ -5,11 +5,14 @@
 import json
 import math
 import pickle
+from copy import deepcopy
+from dataclasses import replace
 
 import pytest
 
 from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel, common
 from aisimulate_core.sdk.config import ModelConfig
+from aisimulate_core.sdk.errors import InvalidEngineConfigurationError
 from aisimulate_core.sdk.models import check_is_moe, get_model
 from aisimulate_core.sdk.models.glm5_next import Glm5NextModel
 from aisimulate_core.sdk.speculation.base import SpeculationConfig
@@ -120,7 +123,9 @@ def test_resident_weight_inventory_and_tp_scaling(tp):
     inventory = (
         2_537_553_920,
         9_358_540_800,
-        27_878_912,
+        # KDA parameter storage, enumerated independently of compute ops:
+        # original + packed Q/K/V conv copies, dt_bias, A_log, BF16 o_norm.
+        34 * (2 * 3 * 8192 * 4 * 4 + 8192 * 4 + 64 * 4 + 128 * 2),
         2_753_901_568,
         141_567_480,
         745_472,
@@ -134,8 +139,17 @@ def test_resident_weight_inventory_and_tp_scaling(tp):
     )
     # Replicated: mHC, routers, MLA down-proj/indexer/norms, decoder norms,
     # KDA f_a/g_a and output norm. All other resident tensors shard over TP.
-    replicated = sum((141_567_480, 99_138_816, 184_549_376, 170_131_456, 78_848, 745_472, 71_303_168, 17_408))
+    replicated = sum((141_567_480, 99_138_816, 184_549_376, 170_131_456, 78_848, 745_472, 71_303_168, 34 * 128 * 2))
     assert resident == (sum(inventory) - replicated) / tp + replicated
+    assert (
+        resident
+        == {
+            1: 320_909_761_272,
+            2: 160_788_642_296,
+            4: 80_728_082_808,
+            8: 40_697_803_064,
+        }[tp]
+    )
     if tp > 1:
         # Replicated projections and mHC mean memory does not divide perfectly.
         assert resident > model(1).get_resident_weights_bytes() / tp
@@ -148,9 +162,9 @@ def test_resident_weight_inventory_and_tp_scaling(tp):
         ({"fmha_quant_mode": common.FMHAQuantMode.fp8}, "bfloat16"),
         ({"gemm_quant_mode": common.GEMMQuantMode.nvfp4}, "fp8_block"),
         ({"moe_quant_mode": common.MoEQuantMode.bfloat16}, "fp8_block"),
-        ({"nextn": 1}, "speculative"),
-        ({"speculation": SpeculationConfig("ngram", {"depth": 2})}, "speculative"),
-        ({"pp_size": 3}, "PP=CP"),
+        ({"nextn": 1}, "speculat"),
+        ({"speculation": SpeculationConfig("ngram", {"depth": 2})}, "speculat"),
+        ({"pp_size": 3}, "PP="),
         ({"overwrite_num_layers": 44}, "layer overrides"),
         ({"moe_tp_size": 1, "moe_ep_size": 4}, "EP=1"),
         ({"enable_eplb": True}, "EPLB"),
@@ -158,13 +172,13 @@ def test_resident_weight_inventory_and_tp_scaling(tp):
     ],
 )
 def test_unsupported_settings_fail_loudly(changes, match):
-    with pytest.raises((ValueError, NotImplementedError), match=match):
+    with pytest.raises(InvalidEngineConfigurationError, match=match):
         model(**changes)
 
 
 @pytest.mark.parametrize("backend", ["sglang", "trtllm"])
 def test_unaudited_backends_rejected(backend):
-    with pytest.raises(ValueError, match="vLLM"):
+    with pytest.raises(InvalidEngineConfigurationError, match="vllm|vLLM"):
         get_model(MODEL, ModelConfig(tp_size=4, moe_tp_size=4, moe_ep_size=1), backend)
 
 
@@ -292,7 +306,28 @@ def test_custom_text_ffn_exclusion_is_rejected(monkeypatch):
     from aisimulate_core.sdk import models
 
     info = deepcopy(models._get_model_info(MODEL))
-    info["raw_config"]["quantization_config"]["modules_to_not_convert"].append("model.layers.3.mlp.experts")
+    info["raw_config"]["quantization_config"]["modules_to_not_convert"].append(
+        "language_model.model.layers.3.mlp.experts"
+    )
     monkeypatch.setattr(models, "_get_model_info", lambda _: info)
     with pytest.raises(ValueError, match="custom FFN"):
         model()
+
+
+@pytest.mark.parametrize("field,value", [("extra_params", None), ("raw_config", None), ("n", None), ("layers", 0)])
+def test_malformed_direct_model_metadata_is_not_fallback_safe(field, value):
+    from aisimulate_core.sdk import models
+
+    info = deepcopy(models._get_model_info(MODEL))
+    info[field] = value
+    with pytest.raises(InvalidEngineConfigurationError, match="GLM5NEXT"):
+        Glm5NextModel(info, ModelConfig(tp_size=4, moe_tp_size=4, moe_ep_size=1), "vllm")
+
+
+def test_direct_model_cannot_bypass_native_shape_checks_with_forged_extra_params():
+    from aisimulate_core.sdk import models
+
+    info = deepcopy(models._get_model_info(MODEL))
+    info["extra_params"] = replace(info["extra_params"], index_head_dim=64)
+    with pytest.raises(InvalidEngineConfigurationError, match="normalized geometry"):
+        Glm5NextModel(info, ModelConfig(tp_size=4, moe_tp_size=4, moe_ep_size=1), "vllm")

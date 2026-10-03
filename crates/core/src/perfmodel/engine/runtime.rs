@@ -666,15 +666,28 @@ impl Engine {
             .saturating_mul(self.nextn.saturating_add(1));
         let stride = stride.max(1);
         let mut total = 0.0_f64;
-        if runtime.osl <= 1 {
+        if runtime.osl <= 1 || bs == 0 {
             return Ok(0.0);
         }
         let upper = runtime.osl - 1; // exclusive, matches Python `range(0, osl-1, stride)`
+        // Validate the entire executed trajectory, not just sampled positions:
+        // a coarse stride still represents every repeated decode token.
+        runtime.isl.checked_add(upper).ok_or_else(|| {
+            AicError::InvalidEngineConfig("inclusive decode sequence length exceeds u32".into())
+        })?;
         let mut i = 0u32;
         while i < upper {
             // Python `s = isl + i + 1`. NOTE the `+1` — distinct from the FPM
             // bridge's `context_length = isl + i` packing convention.
-            let s = runtime.isl + i + 1;
+            let s = runtime
+                .isl
+                .checked_add(i)
+                .and_then(|s| s.checked_add(1))
+                .ok_or_else(|| {
+                    AicError::InvalidEngineConfig(
+                        "inclusive decode sequence length exceeds u32".into(),
+                    )
+                })?;
             let repeat_count = stride.min(upper - i);
             // Per-step name fold FIRST (Python's per-iteration dict), with
             // the phase-dict source merge (mismatch -> Mixed, no
@@ -705,7 +718,7 @@ impl Engine {
                 on_op(op, folded.scaled(repeat_count as f64));
             }
             total += step * repeat_count as f64;
-            i += stride;
+            i += repeat_count;
         }
         Ok(total)
     }
@@ -1378,13 +1391,13 @@ impl Engine {
                 "invalid static phase prefix".into(),
             ));
         }
+        if batch_size == 0 || (prefill && context_length == prefix) {
+            return Ok(Vec::new());
+        }
         if !prefill && context_length == u32::MAX {
             return Err(AicError::InvalidEngineConfig(
                 "decode context length overflows the next token".into(),
             ));
-        }
-        if batch_size == 0 || (prefill && context_length == prefix) {
-            return Ok(Vec::new());
         }
         let token_count = if prefill {
             batch_size.checked_mul(context_length - prefix)
@@ -2128,6 +2141,22 @@ impl Engine {
             return Ok(total);
         }
 
+        // Raw telemetry counts PAST KV; every op-level generation query takes
+        // an INCLUSIVE length. Normalize only here, after the whole-forward
+        // path above (whose collected coordinates must remain past KV). No
+        // decode requests means no decode phase, not an invented batch of one.
+        let decode_s = if has_decode {
+            (sched.sum_decode_kv_tokens / sched.num_decode_requests)
+                .checked_add(1)
+                .ok_or_else(|| {
+                    AicError::InvalidForwardPassMetrics(
+                        "past KV plus current decode token exceeds u32".into(),
+                    )
+                })?
+        } else {
+            0
+        };
+
         if self.has_dsv41_stages() {
             // Retain every scheduled token in balanced aggregate telemetry;
             // integer averages alone discard the remainder. FPM v1 does not
@@ -2155,7 +2184,7 @@ impl Engine {
                 .dsv41_mixed_workload(
                     &prefills,
                     sched.num_decode_requests,
-                    sched.sum_decode_kv_tokens / sched.num_decode_requests.max(1),
+                    decode_s,
                     1.0,
                     1.0,
                     |_, _, _| {},
@@ -2171,8 +2200,7 @@ impl Engine {
             let n_prefill = sched.num_prefill_requests.max(1);
             let new_tokens_per_req = sched.sum_prefill_tokens / n_prefill;
             let prefix_per_req = sched.sum_prefill_kv_tokens / n_prefill;
-            let n_decode = sched.num_decode_requests.max(1);
-            let kv_per_req = sched.sum_decode_kv_tokens / n_decode;
+            let n_decode = sched.num_decode_requests;
             let ctx_tokens = sched.sum_prefill_tokens;
             let gen_tokens = sched.num_decode_requests;
             return get_mix_step_ops(
@@ -2184,7 +2212,7 @@ impl Engine {
                 new_tokens_per_req.max(1),
                 prefix_per_req,
                 sched.sum_prefill_kv_tokens,
-                kv_per_req,
+                decode_s,
                 n_decode,
             );
         }
@@ -2207,13 +2235,12 @@ impl Engine {
         }
 
         if has_decode {
-            let n_decode = sched.num_decode_requests.max(1);
-            let kv_per_req = sched.sum_decode_kv_tokens / n_decode;
+            let n_decode = sched.num_decode_requests;
             total += run_generation_ops_step(
                 &self.generation_ops,
                 &self.db,
                 n_decode,
-                kv_per_req,
+                decode_s,
                 1.0,
                 false,
             )?;
@@ -2379,6 +2406,180 @@ mod tests {
             osl,
             ..Default::default()
         }
+    }
+
+    fn raw_decode_probe(glm: bool) -> Engine {
+        let root = tempfile::tempdir().unwrap();
+        crate::perf_database::energy_test_fixtures::write_energy_systems_root(root.path());
+        let mut db = PerfDatabase::load(root.path(), "testsys", "vllm", "1.0")
+            .unwrap()
+            .with_mode(DatabaseMode::Sol, TransferPolicy::ALL);
+        db.tables_mut().system_spec.gpu.fp32_flops = Some(1e12);
+        db.tables_mut().system_spec.gpu.bfloat16_tc_flops = Some(1e13);
+        db.tables_mut().system_spec.gpu.fp8_tc_flops = Some(2e13);
+        let mut config = fixture_engine_config(None);
+        config.system_name = "testsys".into();
+        config.backend_version = Some("1.0".into());
+        config.database_mode = DatabaseMode::Sol;
+        let (context, generation) =
+            if glm {
+                let sparse = |is_context| {
+                    serde_json::from_value::<Op>(serde_json::json!({
+                "Glm5NextSparseAttention": {
+                    "name": if is_context {"context_attention"} else {"generation_attention"},
+                    "scale_factor": 1.0, "is_context": is_context,
+                    "num_heads": 16, "kv_lora_rank": 512, "qk_head_dim": 256,
+                    "v_head_dim": 256, "index_n_heads": 32, "index_head_dim": 128,
+                    "index_topk": 2048, "index_kpool": 4
+                }
+            })).unwrap()
+                };
+                let kda = |is_context| {
+                    serde_json::from_value::<Op>(serde_json::json!({
+                "Glm5NextKda": {
+                    "name": if is_context {"context_attention"} else {"generation_attention"},
+                    "scale_factor": 1.0, "is_context": is_context,
+                    "num_heads": 16, "head_dim": 128, "conv_kernel": 4
+                }
+            })).unwrap()
+                };
+                (
+                    vec![sparse(true), kda(true)],
+                    vec![sparse(false), kda(false)],
+                )
+            } else {
+                (
+                    vec![context_ops().pop().unwrap()],
+                    vec![generation_ops().pop().unwrap()],
+                )
+            };
+        Engine::build(EngineSpec::new(config, context, generation), Arc::new(db)).unwrap()
+    }
+
+    #[test]
+    fn raw_decode_past_kv_matches_inclusive_static_for_dense_and_glm() {
+        for glm in [false, true] {
+            let engine = raw_decode_probe(glm);
+            for past in [0, 1, 3, 2048, 2049] {
+                let mut metrics = ForwardPassMetrics::default();
+                metrics.scheduled_requests.num_decode_requests = 2;
+                metrics.scheduled_requests.sum_decode_kv_tokens = 2 * past;
+                let raw = engine.forward_pass_time_ms(&[metrics]).unwrap();
+                let same_work = engine
+                    .run_static(&runtime(2, past, 2), StaticMode::Generation, 1)
+                    .unwrap()
+                    .generation_ms;
+                assert_eq!(raw, same_work, "glm={glm}, past={past}");
+                assert!(raw > 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn glm_context_token_overflow_is_an_error_and_x_override_avoids_default_product() {
+        let engine = raw_decode_probe(true);
+        let op = &engine.context_ops[1];
+        assert!(matches!(
+            query_context_op(op, &engine.db, 2, u32::MAX, 0, 1.0, None),
+            Err(AicError::InvalidEngineConfig(_))
+        ));
+        assert!(
+            query_context_op(op, &engine.db, 2, u32::MAX, 0, 1.0, Some(1))
+                .unwrap()
+                .latency_ms
+                > 0.0
+        );
+    }
+
+    #[test]
+    fn raw_mixed_decode_normalizes_zero_and_nonzero_past_without_inventing_work() {
+        for glm in [false, true] {
+            let engine = raw_decode_probe(glm);
+            for past in [0, 3, 2048] {
+                let mut metrics = ForwardPassMetrics::default();
+                metrics.scheduled_requests.num_prefill_requests = 2;
+                metrics.scheduled_requests.sum_prefill_tokens = 6;
+                metrics.scheduled_requests.num_decode_requests = 2;
+                metrics.scheduled_requests.sum_decode_kv_tokens = 2 * past;
+                // Attention-only graph: two three-token prefills, plus two
+                // current decode tokens attending to past+current positions.
+                let prefill = engine
+                    .run_static(&runtime(2, 3, 1), StaticMode::Context, 1)
+                    .unwrap()
+                    .context_ms;
+                let decode = engine
+                    .run_static(&runtime(2, past, 2), StaticMode::Generation, 1)
+                    .unwrap()
+                    .generation_ms;
+                assert_eq!(
+                    engine.forward_pass_time_ms(&[metrics]).unwrap(),
+                    prefill + decode
+                );
+            }
+            assert_eq!(
+                engine
+                    .forward_pass_time_ms(&[ForwardPassMetrics::default()])
+                    .unwrap(),
+                0.0
+            );
+            let mut cached = ForwardPassMetrics::default();
+            cached.scheduled_requests.num_prefill_requests = 2;
+            cached.scheduled_requests.sum_prefill_kv_tokens = 1024;
+            assert_eq!(engine.forward_pass_time_ms(&[cached]).unwrap(), 0.0);
+        }
+    }
+
+    #[test]
+    fn raw_and_static_decode_overflow_are_errors_not_wraparound() {
+        let engine = raw_decode_probe(true);
+        for mixed in [false, true] {
+            let mut metrics = ForwardPassMetrics::default();
+            metrics.scheduled_requests.num_decode_requests = 1;
+            metrics.scheduled_requests.sum_decode_kv_tokens = u32::MAX;
+            if mixed {
+                metrics.scheduled_requests.num_prefill_requests = 1;
+                metrics.scheduled_requests.sum_prefill_tokens = 1;
+            }
+            assert!(matches!(
+                engine.forward_pass_time_ms(&[metrics]),
+                Err(AicError::InvalidForwardPassMetrics(_))
+            ));
+        }
+        assert!(matches!(
+            engine.predict_decode_latency(1, u32::MAX, 2),
+            Err(AicError::InvalidEngineConfig(_))
+        ));
+        // Empty decode phases do not need an inclusive coordinate.
+        assert_eq!(engine.predict_decode_latency(1, u32::MAX, 1).unwrap(), 0.0);
+        assert_eq!(engine.predict_decode_latency(0, u32::MAX, 2).unwrap(), 0.0);
+        assert!(engine.predict_decode_latency(1, u32::MAX - 1, 2).unwrap() > 0.0);
+        for stride in [1, 32, u32::MAX] {
+            assert!(matches!(
+                engine.run_static(&runtime(1, u32::MAX - 1, 3), StaticMode::Generation, stride),
+                Err(AicError::InvalidEngineConfig(_))
+            ));
+        }
+        assert!(
+            engine
+                .static_phase_diagnostics(0, u32::MAX, 0, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            engine
+                .run_static(&runtime(1, 3, 3), StaticMode::Generation, u32::MAX)
+                .unwrap()
+                .generation_ms
+                > 0.0
+        );
+        let mut mixed = ForwardPassMetrics::default();
+        mixed.scheduled_requests.num_prefill_requests = 1;
+        mixed.scheduled_requests.sum_prefill_tokens = u32::MAX;
+        mixed.scheduled_requests.num_decode_requests = 1;
+        assert!(matches!(
+            engine.forward_pass_time_ms(&[mixed]),
+            Err(AicError::InvalidForwardPassMetrics(_))
+        ));
     }
 
     #[test]

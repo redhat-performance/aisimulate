@@ -39,14 +39,16 @@
 
 use pyo3::exceptions::{PyNotImplementedError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::{PyDict, PyTuple, PyType};
 
 use crate::common::enums::{
     CommQuantMode, FmhaQuantMode, GemmQuantMode, KvCacheQuantMode, MoeQuantMode,
 };
 use crate::operators::attention::default_lane_order;
 use crate::operators::dsa::DsaProjectionQuants;
-use crate::operators::glm5_next::{Glm5NextKdaOp, Glm5NextMhcOp, Glm5NextSparseAttentionOp};
+use crate::operators::glm5_next::{
+    Glm5NextFp32LinearOp, Glm5NextKdaOp, Glm5NextMhcOp, Glm5NextSparseAttentionOp,
+};
 use crate::operators::{
     ContextAttentionOp, ContextMlaOp, CustomAllReduceOp, ElementwiseOp, EmbeddingOp,
     EncoderAttentionOp, GemmOp, GenerationAttentionOp, GenerationMlaOp, MhcModuleOp, MlaBmmOp,
@@ -56,6 +58,23 @@ use crate::operators::{
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+/// Preserve hard configuration errors through Python model construction and
+/// back into Rust's compile bridge; ordinary ValueError is fallback-safe there.
+fn glm5_config_error(error: crate::AicError) -> PyErr {
+    if !matches!(error, crate::AicError::InvalidEngineConfig(_)) {
+        return crate::py::aic_to_py(error);
+    }
+    let message = error.to_string();
+    Python::with_gil(|py| {
+        py.import("aisimulate_core.sdk.errors")
+            .and_then(|module| module.getattr("InvalidEngineConfigurationError"))
+            .and_then(|kind| kind.downcast_into::<PyType>().map_err(Into::into))
+            .map(|kind| PyErr::from_type(kind, message.clone()))
+            // Pure-Rust tests can run without the SDK installed.
+            .unwrap_or_else(|_| PyValueError::new_err(message))
+    })
+}
 
 /// Serde token (snake_case wire name) of a quant enum value.
 fn enum_token<T: serde::Serialize>(value: &T) -> String {
@@ -132,24 +151,20 @@ pub(crate) fn wrap_op(py: Python<'_>, op: Op) -> PyResult<Py<PyAny>> {
     }
     match &op {
         Op::Glm5NextSparseAttention(o) => {
-            o.validate()
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            o.validate().map_err(glm5_config_error)?;
             wrap!(PyGlm5NextSparseAttention)
         }
         Op::Glm5NextMhc(o) => {
-            o.validate()
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            o.validate().map_err(glm5_config_error)?;
             wrap!(PyGlm5NextMHC)
         }
         Op::Glm5NextKda(o) => {
-            o.validate()
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            o.validate().map_err(glm5_config_error)?;
             wrap!(PyGlm5NextKDA)
         }
         Op::Glm5NextFp32Linear(o) => {
-            o.validate()
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            Ok(Py::new(py, PyOperation { inner: op })?.into_any())
+            o.validate().map_err(glm5_config_error)?;
+            wrap!(PyGlm5NextFp32Linear)
         }
         Op::Gemm(_) => wrap!(PyGemm),
         Op::Embedding(_) => wrap!(PyEmbedding),
@@ -318,6 +333,13 @@ inner_accessor!(
     Glm5NextKdaOp,
     "Glm5NextKDA"
 );
+inner_accessor!(
+    glm5_fp32,
+    glm5_fp32_mut,
+    Glm5NextFp32Linear,
+    Glm5NextFp32LinearOp,
+    "Glm5NextFp32Linear"
+);
 
 impl PyOperation {
     /// The MLA module struct regardless of phase variant.
@@ -367,6 +389,15 @@ impl PyOperation {
     fn set_scale_factor(&mut self, value: f64) -> PyResult<()> {
         // Match the getter contract; composites and FPM have no scalar field.
         self.scale_factor()?;
+        if matches!(
+            self.inner,
+            Op::Glm5NextSparseAttention(_)
+                | Op::Glm5NextMhc(_)
+                | Op::Glm5NextKda(_)
+                | Op::Glm5NextFp32Linear(_)
+        ) {
+            crate::operators::glm5_next::validate_scale(value).map_err(glm5_config_error)?;
+        }
         self.inner.set_scale_factor(value);
         Ok(())
     }
@@ -4310,8 +4341,7 @@ impl PyGlm5NextSparseAttention {
             index_topk,
             index_kpool,
         };
-        o.validate()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        o.validate().map_err(glm5_config_error)?;
         Ok((
             Self,
             PyOperation {
@@ -4380,8 +4410,7 @@ impl PyGlm5NextMHC {
             hc_mult,
             hc_sinkhorn_iters,
         };
-        o.validate()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        o.validate().map_err(glm5_config_error)?;
         Ok((
             Self,
             PyOperation {
@@ -4437,8 +4466,7 @@ impl PyGlm5NextKDA {
             head_dim,
             conv_kernel,
         };
-        o.validate()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        o.validate().map_err(glm5_config_error)?;
         Ok((
             Self,
             PyOperation {
@@ -4471,6 +4499,56 @@ impl PyGlm5NextKDA {
     #[getter(_num_heads)]
     fn num_heads(slf: PyRef<'_, Self>) -> PyResult<u32> {
         Ok(slf.as_super().glm5_kda()?.num_heads)
+    }
+}
+
+/// Scalar FP32 projection with native geometry, residency and pickle support.
+#[pyclass(extends = PyOperation, subclass, name = "Glm5NextFp32Linear", module = "aisimulate_core._native")]
+pub struct PyGlm5NextFp32Linear;
+
+#[pymethods]
+impl PyGlm5NextFp32Linear {
+    #[classattr]
+    #[allow(non_upper_case_globals)]
+    const _ENGINE_QUERY_SHAPE: &'static str = "tokens";
+    #[classattr]
+    const _ESTIMATION_PROVENANCE: &'static str = "analytic_unvalidated";
+
+    #[new]
+    #[pyo3(signature = (name, num, n, k))]
+    fn new(name: String, num: f64, n: u32, k: u32) -> PyResult<(Self, PyOperation)> {
+        let o = Glm5NextFp32LinearOp {
+            name,
+            scale_factor: num,
+            n,
+            k,
+        };
+        o.validate().map_err(glm5_config_error)?;
+        Ok((
+            Self,
+            PyOperation {
+                inner: Op::Glm5NextFp32Linear(o),
+            },
+        ))
+    }
+
+    fn __getnewargs_ex__<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyTuple>, Bound<'py, PyDict>)> {
+        let o = slf.as_super().glm5_fp32()?;
+        let args = (o.name.clone(), o.scale_factor, o.n, o.k).into_pyobject(py)?;
+        Ok((args, PyDict::new(py)))
+    }
+
+    #[getter(_n)]
+    fn n(slf: PyRef<'_, Self>) -> PyResult<u32> {
+        Ok(slf.as_super().glm5_fp32()?.n)
+    }
+
+    #[getter(_k)]
+    fn k(slf: PyRef<'_, Self>) -> PyResult<u32> {
+        Ok(slf.as_super().glm5_fp32()?.k)
     }
 }
 
@@ -4512,14 +4590,21 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGlm5NextSparseAttention>()?;
     m.add_class::<PyGlm5NextMHC>()?;
     m.add_class::<PyGlm5NextKDA>()?;
+    m.add_class::<PyGlm5NextFp32Linear>()?;
     Ok(())
 }
 
 /// Deserialize one externally-tagged opspec JSON document into an
 /// engine-backed op object (used by the FPMForwardOp spec adapter).
 pub(crate) fn op_from_spec_json(py: Python<'_>, spec_json: &str) -> PyResult<Py<PyAny>> {
-    let op: Op = serde_json::from_str(spec_json)
-        .map_err(|e| PyValueError::new_err(format!("invalid opspec json: {e}")))?;
+    // Serde failures (negative/out-of-range/null dimensions, missing fields)
+    // are invalid configuration too, not missing model or timing coverage.
+    // Keep the same hard-error classification as semantic geometry validation.
+    let op: Op = serde_json::from_str(spec_json).map_err(|e| {
+        glm5_config_error(crate::AicError::InvalidEngineConfig(format!(
+            "invalid opspec json: {e}"
+        )))
+    })?;
     wrap_op(py, op)
 }
 

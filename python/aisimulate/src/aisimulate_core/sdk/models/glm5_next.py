@@ -21,9 +21,14 @@ import aisimulate_core._native as core
 import aisimulate_core.sdk.operations as ops
 from aisimulate_core.sdk import common
 from aisimulate_core.sdk.errors import InvalidEngineConfigurationError
+from aisimulate_core.sdk.glm5_next import (
+    effective_glm5_next_quantization,
+    parse_glm5_next_config,
+    validate_glm5_next_ffn_exclusions,
+)
 from aisimulate_core.sdk.models.base import BaseModel, register_model
 from aisimulate_core.sdk.models.blocks.moe import MoEBlockShape, build_moe_block_ops
-from aisimulate_core.sdk.models.helpers import power_law_distribution, quant_exclude_patterns
+from aisimulate_core.sdk.models.helpers import power_law_distribution
 
 
 def _fp32(name: str, count: int, n: int, k: int):
@@ -50,9 +55,18 @@ class Glm5NextModel(BaseModel):
         return cls(model_info, model_config, backend_name)
 
     def __init__(self, info, cfg, backend_name):
-        d = info["extra_params"]
+        d = info.get("extra_params")
         if not isinstance(d, common.Glm5NextConfig):
-            raise TypeError("GLM5NEXT requires Glm5NextConfig metadata")
+            raise InvalidEngineConfigurationError("GLM5NEXT requires Glm5NextConfig metadata")
+        if cfg.overwrite_num_layers:
+            raise InvalidEngineConfigurationError("GLM5NEXT layer overrides cannot preserve the hybrid layer plan")
+        raw = info.get("raw_config")
+        parsed = parse_glm5_next_config(raw)
+        if any(info.get(field) != value for field, value in parsed.items()):
+            raise InvalidEngineConfigurationError(
+                "GLM5NEXT normalized geometry must agree with raw checkpoint metadata"
+            )
+        cfg.resolve_execution_profile(info["model_path"], info["model_family"], backend_name)
         if backend_name != "vllm":
             raise InvalidEngineConfigurationError("GLM5NEXT currently models the vLLM text-only baseline")
         if cfg.pp_size != 1 or cfg.cp_size != 1 or cfg.attention_dp_size != 1:
@@ -60,7 +74,7 @@ class Glm5NextModel(BaseModel):
         if cfg.nextn or (cfg.speculation is not None and cfg.speculation.kind != "none"):
             raise InvalidEngineConfigurationError("GLM5NEXT speculative decoding is not modeled; use nextn=0")
         if cfg.overwrite_num_layers or info["layers"] != len(d.layer_types):
-            raise ValueError("GLM5NEXT layer overrides cannot preserve the hybrid layer plan")
+            raise InvalidEngineConfigurationError("GLM5NEXT layer overrides cannot preserve the hybrid layer plan")
         if cfg.moe_backend or cfg.moe_comm_backend or cfg.enable_eplb or cfg.wideep_num_slots or cfg.decoder_replay:
             raise InvalidEngineConfigurationError("GLM5NEXT does not model large EP, EPLB or decoder replay")
         if cfg.attention_backend is not None:
@@ -70,9 +84,9 @@ class Glm5NextModel(BaseModel):
         if cfg.tp_size not in (1, 2, 4, 8) or cfg.moe_ep_size != 1 or cfg.moe_tp_size != cfg.tp_size:
             raise InvalidEngineConfigurationError("GLM5NEXT baseline requires TP in {1,2,4,8}, MoE TP=TP and EP=1")
         if d.kda_num_heads % cfg.tp_size or info["n"] % cfg.tp_size:
-            raise ValueError("GLM5NEXT attention and KDA heads must divide TP")
+            raise InvalidEngineConfigurationError("GLM5NEXT attention and KDA heads must divide TP")
         if info["inter_size"] % cfg.tp_size or d.moe_inter_size % cfg.tp_size or info["vocab"] % cfg.tp_size:
-            raise ValueError("GLM5NEXT FFN widths and vocabulary must divide TP")
+            raise InvalidEngineConfigurationError("GLM5NEXT FFN widths and vocabulary must divide TP")
         if cfg.gemm_quant_mode != common.GEMMQuantMode.fp8_block or cfg.moe_quant_mode != common.MoEQuantMode.fp8_block:
             raise InvalidEngineConfigurationError("GLM5NEXT baseline requires native fp8_block GEMM and MoE weights")
         if (
@@ -82,7 +96,6 @@ class Glm5NextModel(BaseModel):
             raise InvalidEngineConfigurationError("GLM5NEXT baseline requires bfloat16 KV cache and attention compute")
         if cfg.comm_quant_mode != common.CommQuantMode.half:
             raise InvalidEngineConfigurationError("GLM5NEXT baseline requires half communication")
-        raw = info["raw_config"]
         text = raw["text_config"]
         if (
             text.get("index_kpool_compress") is not True
@@ -93,16 +106,10 @@ class Glm5NextModel(BaseModel):
             or text["linear_attn_config"].get("gate_lower_bound") != -5.0
         ):
             raise InvalidEngineConfigurationError("GLM5NEXT requires the native compressed-indexer/KDA/FFN contract")
-        quant = raw.get("quantization_config", {})
+        quant = effective_glm5_next_quantization(raw)
         if quant.get("quant_method") != "fp8" or quant.get("weight_block_size") != [128, 128]:
             raise InvalidEngineConfigurationError("GLM5NEXT baseline requires the native block128 FP8 checkpoint")
-        if any(
-            p.startswith("model.layers.")
-            and ".mlp." in p
-            and not p.endswith((".mlp.gate", ".mlp.gate.e_score_correction_bias"))
-            for p in quant_exclude_patterns(raw)
-        ):
-            raise InvalidEngineConfigurationError("GLM5NEXT custom FFN quantization exclusions are not modeled")
+        validate_glm5_next_ffn_exclusions(quant, d.mlp_layer_types, d.num_shared_experts)
         super().__init__(
             info["model_path"],
             info["model_family"],
@@ -122,8 +129,13 @@ class Glm5NextModel(BaseModel):
         self._topk, self._num_experts, self._moe_inter_size = d.topk, d.num_experts, d.moe_inter_size
         self._linear_layers = d.layer_types.count("linear_attention")
         self._sparse_layers = d.layer_types.count("deepseek_sparse_attention")
-        self.context_ops = self._phase_ops(True)
-        self.generation_ops = self._phase_ops(False)
+        try:
+            self.context_ops = self._phase_ops(True)
+            self.generation_ops = self._phase_ops(False)
+        except (ValueError, TypeError, OverflowError) as exc:
+            # Native constructor/deserialization shape errors are not missing
+            # performance data. Coverage failures occur later during queries.
+            raise InvalidEngineConfigurationError(f"GLM5NEXT invalid native graph geometry: {exc}") from exc
         self._resident_weight_bytes = self._weight_inventory()
 
     @property
@@ -238,8 +250,10 @@ class Glm5NextModel(BaseModel):
         p = local_heads * d.kda_head_dim
         total = sum(op.get_weights() for op in self.context_ops)
         # Original FP32 Q/K/V conv weights and vLLM's retained concatenated copy.
+        # dt_bias and A_log are FP32; the replicated output-norm parameter is
+        # BF16 under the loader's default dtype, despite its FP32 arithmetic.
         total += self._linear_layers * (
-            2 * 3 * p * d.kda_conv_kernel * 4 + 4 * p + 4 * local_heads + 4 * d.kda_head_dim
+            2 * 3 * p * d.kda_conv_kernel * 4 + 4 * p + 4 * local_heads + 2 * d.kda_head_dim
         )
         # Absorbed kv_b is resident but its BMM work is owned by sparse attention.
         total += self._sparse_layers * (

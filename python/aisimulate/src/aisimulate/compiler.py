@@ -225,13 +225,14 @@ def _deployment(
                     )
                 }
             )
-        metadata = _worker_performance_model_metadata(engine, worker)
+        engine_args = _worker_engine_args(engine, worker, "aggregated", transfer_bytes_per_token=None)
+        metadata = _worker_performance_model_metadata(engine, worker, engine_args=engine_args)
         if worker.kv_cache.state_cache is not None:
             metadata["state_cache"] = state_size
         return BackendDeploymentSpec(
             parallel_config=parallel,
             performance_model_metadata={"aggregated": metadata},
-            agg_engine_args=_worker_engine_args(engine, worker, "aggregated", transfer_bytes_per_token=None),
+            agg_engine_args=engine_args,
             num_workers=worker.parallelism.replicas,
             **common,
         )
@@ -249,18 +250,16 @@ def _deployment(
         **_parallel_mapping(prefill, prefix="prefill_"),
         **_parallel_mapping(decode, prefix="decode_"),
     }
+    prefill_args = _worker_engine_args(engine, prefill, "prefill", transfer_bytes_per_token=transfer_bytes_per_token)
+    decode_args = _worker_engine_args(engine, decode, "decode", transfer_bytes_per_token=transfer_bytes_per_token)
     return BackendDeploymentSpec(
         parallel_config=parallel,
         performance_model_metadata={
-            "prefill": _worker_performance_model_metadata(engine, prefill),
-            "decode": _worker_performance_model_metadata(engine, decode),
+            "prefill": _worker_performance_model_metadata(engine, prefill, engine_args=prefill_args),
+            "decode": _worker_performance_model_metadata(engine, decode, engine_args=decode_args),
         },
-        prefill_engine_args=_worker_engine_args(
-            engine, prefill, "prefill", transfer_bytes_per_token=transfer_bytes_per_token
-        ),
-        decode_engine_args=_worker_engine_args(
-            engine, decode, "decode", transfer_bytes_per_token=transfer_bytes_per_token
-        ),
+        prefill_engine_args=prefill_args,
+        decode_engine_args=decode_args,
         num_prefill_workers=prefill.parallelism.replicas,
         num_decode_workers=decode.parallelism.replicas,
         **common,
@@ -378,7 +377,7 @@ def _parallel_mapping(worker: WorkerPredictionConfig, *, prefix: str) -> dict[st
 
 
 def _worker_performance_model_metadata(
-    engine: EnginePredictionConfig, worker: WorkerPredictionConfig
+    engine: EnginePredictionConfig, worker: WorkerPredictionConfig, *, engine_args: dict[str, JSONValue] | None = None
 ) -> dict[str, JSONValue]:
     parallel = worker.parallelism
     sharded_moe = parallel.moe_tensor * parallel.moe_expert > 1
@@ -399,6 +398,7 @@ def _worker_performance_model_metadata(
             if getattr(engine, name) not in (None, False)
         },
         **({"decoder_replay": True} if engine.decoder_replay else {}),
+        **({"execution_profile": engine.execution_profile} if engine.execution_profile is not None else {}),
         **{
             field: getattr(engine, field)
             for field in ("enable_shared_layer", "strict_provenance")
@@ -410,6 +410,12 @@ def _worker_performance_model_metadata(
         config["speculation"] = engine.speculation.cost_config()
     if worker.timing.fpm_parquet_path is not None:
         config["fpm_parquet_path"] = worker.timing.fpm_parquet_path
+    if engine_args is not None:
+        timing_model = engine_args.get("timing_model")
+        timing_config = timing_model.get("config") if isinstance(timing_model, dict) else None
+        if isinstance(timing_config, dict) and timing_config.get("execution_profile") is not None:
+            config["execution_profile"] = timing_config["execution_profile"]
+            config["model_family"] = timing_config["model_family"]
     return {
         "provider": "aic",
         "config": config,
@@ -427,6 +433,37 @@ def _worker_engine_args(
     parallel = worker.parallelism
     cache = worker.kv_cache
     capacity = cache.capacity
+    # Validate cache behavior even with custom timing/manual capacity, where
+    # the native AIC timing provider is not constructed. Rust owns inference.
+    import json
+
+    import aisimulate_core
+
+    profile_request = {
+        "model": engine.model,
+        "system": worker.hardware or engine.hardware,
+        "backend": backend,
+        "worker_type": role,
+        "tp": parallel.tensor,
+        "pp": parallel.pipeline,
+        "attention_dp": parallel.attention_data,
+        "moe_tp_size": parallel.moe_tensor if parallel.moe_tensor * parallel.moe_expert > 1 else None,
+        "moe_ep_size": parallel.moe_expert if parallel.moe_tensor * parallel.moe_expert > 1 else None,
+    }
+    if engine.execution_profile is not None:
+        profile_request["execution_profile"] = engine.execution_profile
+    profile_identity = json.loads(
+        aisimulate_core.RustForwardPassPerfModel.normalize_config(json.dumps(profile_request))
+    )
+    if profile_identity.get("execution_profile") is not None:
+        aisimulate_core.RustForwardPassPerfModel.validate_replay_cache(
+            json.dumps(profile_identity),
+            cache.prefix_caching,
+            cache.host_offload is not None or cache.g3_offload is not None,
+            cache.prefix_match_unit is not None,
+        )
+        if worker.timing.type != "default" or engine.mode == "afd" or engine.workers.encoder is not None:
+            raise ValueError("glm5_next_text_tp_v1 requires canonical default timing without AFD/encoder providers")
     memory_fraction = capacity.memory_fraction
     if capacity.type == "default" and memory_fraction is None:
         memory_fraction = 0.88 if backend == "sglang" else 0.9
@@ -529,6 +566,7 @@ def _worker_engine_args(
             backend_version=engine.backend_version,
             worker_type=role,
             decoder_replay=engine.decoder_replay,
+            execution_profile=engine.execution_profile,
             enable_shared_layer=engine.enable_shared_layer,
             strict_provenance=bool(engine.strict_provenance),
             tp=parallel.tensor,
@@ -549,7 +587,12 @@ def _worker_engine_args(
             transfer_policy=timing.transfer_policy if timing.transfer_policy is not None else engine.transfer_policy,
             systems_paths=resolve_systems_paths(timing.systems_paths or engine.systems_paths),
         )
-        timing_config = omit_inactive_moe_controls(canonical.to_dict())
+        timing_config = canonical.to_dict()
+        if profile_identity.get("execution_profile") is not None:
+            timing_config = json.loads(
+                aisimulate_core.RustForwardPassPerfModel.normalize_config(json.dumps(timing_config))
+            )
+        timing_config = omit_inactive_moe_controls(timing_config)
         if timing.fpm_parquet_path is not None:
             interpolation = timing_config["estimator_config"].setdefault("fpm_interpolation", {})
             if interpolation.get("fpm_parquet_path", timing.fpm_parquet_path) != timing.fpm_parquet_path:

@@ -189,6 +189,7 @@ def get_model(
     raw_config = model_info.get("raw_config", {})
     architecture = model_info["architecture"]
     model_family = _architecture_to_model_family(architecture)
+    model_config.resolve_execution_profile(model_path, model_family, backend_name)
 
     # Preserve caller intent before checkpoint defaults fill unset modes.
     # Model-specific mixed-precision splitters use this provenance rather than

@@ -358,7 +358,9 @@ def _engine_config_dict(
         # directory, so the Rust reload skips its missing-directory gate for
         # exactly this identity.
         "tolerate_dirless_version": bool(getattr(database, "dirless_next_load", False)),
-        "extra": {},
+        "extra": (
+            {"execution_profile": cfg.execution_profile} if getattr(cfg, "execution_profile", None) is not None else {}
+        ),
     }
     # SpeculativeConfig (flattened, Option<>): emit nextn at the top level
     # when MTP is active. When inactive, omit it so the
@@ -438,6 +440,8 @@ def compile_engine(
     systems_path: str | None = None,
     forward_model: str | None = None,
     decoder_replay: bool = False,
+    execution_profile: str | None = None,
+    language_only: bool | None = None,
     database_mode: str | None = None,
     shared_layer: bool | None = None,
     transfer_policy: str | list[str] | None = None,
@@ -505,6 +509,8 @@ def compile_engine(
     except (ValueError, TypeError, KeyError) as exc:
         raise InvalidEngineConfigurationError(str(exc)) from exc
     model_config.decoder_replay = decoder_replay
+    model_config.execution_profile = execution_profile
+    model_config.language_only = language_only
     try:
         resolve_dsv4_moe_arch(model_config, model_path, system_name=system, backend_name=backend)
     except (ValueError, TypeError, KeyError) as exc:

@@ -112,11 +112,13 @@ pub(crate) fn query_context_op(
     seq_imbalance_correction_scale: f64,
     x_override: Option<u32>,
 ) -> Result<PerformanceResult, AicError> {
-    let x = x_override.unwrap_or(if op.is_logits_gemm() {
-        batch_size
-    } else {
-        batch_size * effective_isl
-    });
+    let x = match x_override {
+        Some(x) => x,
+        None if op.is_logits_gemm() => batch_size,
+        None => batch_size.checked_mul(effective_isl).ok_or_else(|| {
+            AicError::InvalidEngineConfig("context token count exceeds u32".into())
+        })?,
+    };
     let ctx = RuntimeContext {
         batch_size,
         beam_width: 1,
@@ -278,7 +280,7 @@ pub(crate) fn get_mix_step_ops(
     new_tokens_per_prefill_req: u32,
     prefix_per_req: u32,
     combined_prefix: u32,
-    kv_per_decode_req: u32,
+    inclusive_decode_length: u32,
     decode_batch: u32,
 ) -> Result<f64, AicError> {
     // ---- Pass 1: combined non-attention work (batch=1, isl=ctx+gen) ----
@@ -298,7 +300,12 @@ pub(crate) fn get_mix_step_ops(
     // produce the same `(full_s, prefix_correction)` Python applies.
     // For non-attention ops (GEMM, MoE, etc.) the prefix field is
     // ignored, so threading it through is harmless.
-    let effective_isl_combined = (ctx_tokens + gen_tokens).max(1);
+    let effective_isl_combined = ctx_tokens.checked_add(gen_tokens).ok_or_else(|| {
+        AicError::InvalidForwardPassMetrics("mixed scheduled token count exceeds u32".into())
+    })?;
+    if effective_isl_combined == 0 {
+        return Ok(0.0);
+    }
     let mut total = 0.0_f64;
     for op in context_ops {
         if op.is_context_attention() {
@@ -335,8 +342,8 @@ pub(crate) fn get_mix_step_ops(
     // their full ISL through the packing if they need exact parity
     // with Python's chunked path.
     let isl_eff_pass2 = new_tokens_per_prefill_req.max(1);
-    let ctx_attn_batch = ((ctx_tokens + isl_eff_pass2 - 1) / isl_eff_pass2).max(1);
-    let scale_factor = ((isl_eff_pass2 + ctx_tokens - 1) / ctx_tokens.max(1)).max(1) as f64;
+    let ctx_attn_batch = ctx_tokens.div_ceil(isl_eff_pass2).max(1);
+    let scale_factor = isl_eff_pass2.div_ceil(ctx_tokens.max(1)).max(1) as f64;
     for op in context_ops {
         if !op.is_context_attention() {
             continue;
@@ -369,7 +376,7 @@ pub(crate) fn get_mix_step_ops(
             let ctx = RuntimeContext {
                 batch_size: decode_batch,
                 beam_width: 1,
-                s: kv_per_decode_req.max(1),
+                s: inclusive_decode_length,
                 prefix: 0,
                 num_tokens: decode_batch,
                 seq_imbalance_correction_scale: 1.0,

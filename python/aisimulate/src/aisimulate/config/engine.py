@@ -351,6 +351,8 @@ class KvTransferConfig(StrictModel):
 
 
 class EstimatorPolicyConfig(StrictModel):
+    # Core owns the enum and family/topology validation; callers pass identity.
+    execution_profile: str | None = None
     nextn: NonNegativeInt = Field(default=0, le=5)
     nextn_accepted: NonNegativeFloat | None = None
     enable_chunked_prefill: bool | None = Field(default=None, strict=True)
@@ -371,8 +373,10 @@ class EstimatorPolicyConfig(StrictModel):
             raise ValueError("nextn requires explicit nextn_accepted")
         if self.nextn_accepted is not None and (not self.nextn or self.nextn_accepted > self.nextn):
             raise ValueError("nextn_accepted requires nextn > 0 and must be within [0, nextn]")
-        active = self.nextn or any(
-            is_active_engine_model_control(name, getattr(self, name)) for name in ENGINE_MODEL_CONTROL_FIELDS
+        active = (
+            self.nextn
+            or self.execution_profile is not None
+            or any(is_active_engine_model_control(name, getattr(self, name)) for name in ENGINE_MODEL_CONTROL_FIELDS)
         )
         mode = getattr(self, "mode", "aggregated")
         modes = mode.choices if hasattr(mode, "choices") else [mode]
@@ -421,6 +425,7 @@ class EstimatorPolicyConfig(StrictModel):
             or self.estimation_mode != "auto"
             or self.fallback_policy != "deny"
             or bool(self.estimator_config)
+            or self.execution_profile is not None
             or getattr(self, "decoder_replay", False)
             or getattr(self, "enable_shared_layer", None) is not None
             or getattr(self, "strict_provenance", None) is not None
@@ -683,6 +688,11 @@ class EngineRecommendationConfig(EstimatorPolicyConfig):
 
     @model_validator(mode="after")
     def _validate_roles(self) -> EngineRecommendationConfig:
+        if self.execution_profile is not None:
+            raise ValueError(
+                "explicit execution_profile recommendation input requires profile-aware Sweeper controls; "
+                "GLM baseline identity is still inferred by the canonical Core estimator"
+            )
         modes = set(self.mode.choices) if isinstance(self.mode, Choices) else {self.mode}
         _validate_worker_hardware(modes=modes, workers=self.workers)
         if "afd" in modes:

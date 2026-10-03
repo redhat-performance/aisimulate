@@ -123,19 +123,19 @@ impl Availability<'_> {
         match op {
             Glm5NextSparseAttention(o) => {
                 o.validate()?;
-                return crate::operators::glm5_next::mode_ready(self.db.database_mode);
+                return crate::operators::glm5_next::hardware_ready(self.db, true);
             }
             Glm5NextMhc(o) => {
                 o.validate()?;
-                return crate::operators::glm5_next::mode_ready(self.db.database_mode);
+                return crate::operators::glm5_next::hardware_ready(self.db, false);
             }
             Glm5NextKda(o) => {
                 o.validate()?;
-                return crate::operators::glm5_next::mode_ready(self.db.database_mode);
+                return crate::operators::glm5_next::hardware_ready(self.db, false);
             }
             Glm5NextFp32Linear(o) => {
                 o.validate()?;
-                return crate::operators::glm5_next::mode_ready(self.db.database_mode);
+                return crate::operators::glm5_next::hardware_ready(self.db, false);
             }
             Dsv41Stage(stage) => {
                 for child in &stage.children {
@@ -361,6 +361,120 @@ mod tests {
     use crate::perf_database::energy_test_fixtures::{Col, write_parquet};
     use crate::perfmodel::engine::{Engine, spec::EngineSpec};
     use std::sync::Arc;
+
+    #[test]
+    fn glm5_preflight_checks_required_rates_without_reclassifying_data_misses() {
+        let root = systems();
+        let sparse: Op = serde_json::from_value(serde_json::json!({
+            "Glm5NextSparseAttention": {
+                "name": "context_attention", "scale_factor": 1.0, "is_context": true,
+                "num_heads": 16, "kv_lora_rank": 512, "qk_head_dim": 256,
+                "v_head_dim": 256, "index_n_heads": 32, "index_head_dim": 128,
+                "index_topk": 2048, "index_kpool": 4
+            }
+        }))
+        .unwrap();
+        let mhc: Op = serde_json::from_value(serde_json::json!({
+            "Glm5NextMhc": {"name": "mhc", "scale_factor": 1.0,
+                "hidden_size": 4096, "hc_mult": 4, "hc_sinkhorn_iters": 20}
+        }))
+        .unwrap();
+        let kda: Op = serde_json::from_value(serde_json::json!({
+            "Glm5NextKda": {"name": "context_attention", "scale_factor": 1.0,
+                "is_context": true, "num_heads": 16, "head_dim": 128, "conv_kernel": 4}
+        }))
+        .unwrap();
+        let linear: Op = serde_json::from_value(serde_json::json!({
+            "Glm5NextFp32Linear": {"name": "fp32", "scale_factor": 1.0, "n": 32, "k": 4096}
+        }))
+        .unwrap();
+        for mode in [
+            DatabaseMode::Sol,
+            DatabaseMode::Hybrid,
+            DatabaseMode::Empirical,
+        ] {
+            let load = || {
+                PerfDatabase::load(root.path(), "b200_sxm", "vllm", "0.24.0")
+                    .unwrap()
+                    .with_mode(mode, TransferPolicy::ALL)
+            };
+            for op in [&sparse, &mhc, &kda, &linear] {
+                engine_readiness(load(), op.clone()).unwrap();
+                for rate in [
+                    None,
+                    Some(0.0),
+                    Some(-1.0),
+                    Some(f64::NAN),
+                    Some(f64::INFINITY),
+                ] {
+                    let mut db = load();
+                    db.tables_mut().system_spec.gpu.fp32_flops = rate;
+                    assert!(matches!(
+                        engine_readiness(db, op.clone()),
+                        Err(AicError::MissingSystemFlops(_))
+                    ));
+                }
+            }
+            for fp8 in [true, false] {
+                for rate in [
+                    None,
+                    Some(0.0),
+                    Some(-1.0),
+                    Some(f64::NAN),
+                    Some(f64::INFINITY),
+                ] {
+                    let mut db = load();
+                    if fp8 {
+                        db.tables_mut().system_spec.gpu.fp8_tc_flops = rate;
+                    } else {
+                        db.tables_mut().system_spec.gpu.bfloat16_tc_flops = rate;
+                    }
+                    // Scalar-only operations do not require a tensor-core rate.
+                    validate(&db, [&mhc, &kda, &linear].into_iter()).unwrap();
+                    assert!(matches!(
+                        engine_readiness(db, sparse.clone()),
+                        Err(AicError::MissingSystemFlops(_))
+                    ));
+                }
+            }
+            for op in [&sparse, &mhc, &kda, &linear] {
+                for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+                    let mut db = load();
+                    db.tables_mut().system_spec.gpu.mem_bw = bad;
+                    assert!(matches!(
+                        engine_readiness(db, op.clone()),
+                        Err(AicError::InvalidEngineConfig(_))
+                    ));
+                    let mut db = load();
+                    db.tables_mut()
+                        .system_spec
+                        .gpu
+                        .mem_bw_empirical_scaling_factor = bad;
+                    assert_eq!(
+                        engine_readiness(db, op.clone()).is_ok(),
+                        mode == DatabaseMode::Sol
+                    );
+                }
+                for bad in [-1.0, f64::NAN, f64::INFINITY] {
+                    let mut db = load();
+                    db.tables_mut()
+                        .system_spec
+                        .gpu
+                        .mem_empirical_constant_latency = bad;
+                    assert_eq!(
+                        engine_readiness(db, op.clone()).is_ok(),
+                        mode == DatabaseMode::Sol
+                    );
+                }
+            }
+        }
+        let db = PerfDatabase::load(root.path(), "b200_sxm", "vllm", "0.24.0").unwrap();
+        let err = engine_readiness(db, sparse).unwrap_err();
+        assert!(
+            err.is_missing_perf_data(),
+            "SILICON remains a genuine data miss: {err}"
+        );
+    }
 
     fn systems() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();

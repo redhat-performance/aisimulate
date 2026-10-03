@@ -8,6 +8,7 @@ Sweep output correctness is validated by the integration parity test
 the unit coverage here targets local control flow and terminal classification.
 """
 
+from copy import deepcopy
 from unittest.mock import MagicMock
 
 import pandas as pd
@@ -704,6 +705,8 @@ def test_sweep_disagg_epd_kimi_k3_keeps_both_language_workers_encoder_free(video
         else dict(image_height=224, image_width=224, num_images_per_request=1)
     )
     template = config.ModelConfig(enable_encoder_dp=False)
+    assert template.language_only is None  # Omission, not an explicit tower-residency request.
+    template_before = deepcopy(template)
     model_config = (lambda _parallel: template) if config_builder else template
     rows = sweep_disagg(
         model_path="moonshotai/Kimi-K3",
@@ -742,7 +745,9 @@ def test_sweep_disagg_epd_kimi_k3_keeps_both_language_workers_encoder_free(video
     assert (rows["encoder_latency"] > 0).all()
     assert (rows["ttft"] > rows["encoder_latency"]).all()
     assert (rows["seq/s"] > 0).all()
-    assert template.language_only is False
+    # EPD pins belong to worker copies; the caller's omitted intent stays intact.
+    assert template.language_only is None
+    assert template == template_before
 
 
 def test_sweep_agg_epd_language_only_pin_survives_config_builder(monkeypatch):
@@ -842,8 +847,11 @@ def test_sweep_agg_epd_composes_encoder_stage(monkeypatch):
     captured: dict = {}
 
     def _fake_get_model(*, model_path, model_config, backend_name):
+        captured["language_only_before_resolution"] = model_config.language_only
+        # Mirror get_model's composition boundary for this non-GLM family.
+        model_config.resolve_execution_profile(model_path, "LLAMA", backend_name)
         captured["language_only"] = model_config.language_only
-        return MagicMock()
+        return MagicMock(config=model_config)
 
     monkeypatch.setattr(sweep, "get_model", _fake_get_model)
     monkeypatch.setattr(sweep, "get_backend", lambda name: MagicMock())
@@ -867,12 +875,16 @@ def test_sweep_agg_epd_composes_encoder_stage(monkeypatch):
 
     # Default: encoder stays inline (colocated); rows pass through untouched.
     agg_df = sweep.sweep_agg(**common_kwargs)
+    assert captured["language_only_before_resolution"] is None
     assert captured["language_only"] is False
+    assert common_kwargs["model_config"].language_only is None
     assert agg_df.iloc[0]["ttft"] == pytest.approx(100.0)
 
     # E+agg: language-only agg workers + encode pool.
     epd_df = sweep.sweep_agg(**common_kwargs, enable_epd=True, encoder_tp_list=[2])
+    assert captured["language_only_before_resolution"] is True
     assert captured["language_only"] is True
+    assert common_kwargs["model_config"].language_only is None
     row = epd_df.iloc[0]
     # TTFT = agg ttft + raw encode batch latency (run_agg's inline convention).
     assert row["ttft"] == pytest.approx(150.0)
@@ -886,6 +898,9 @@ def test_sweep_agg_epd_composes_encoder_stage(monkeypatch):
 
     # Replica budget: num_gpu_list=[6] leaves exactly one feasible cell.
     row = sweep.sweep_agg(**common_kwargs, enable_epd=True, encoder_tp_list=[2], num_gpu_list=[6]).iloc[0]
+    assert captured["language_only_before_resolution"] is True
+    assert captured["language_only"] is True
+    assert common_kwargs["model_config"].language_only is None
     assert (row["(a)workers"], row["(e)workers"]) == (1, 1)
     assert row["num_total_gpus"] == 6
 

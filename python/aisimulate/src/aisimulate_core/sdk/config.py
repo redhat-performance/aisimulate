@@ -95,7 +95,10 @@ class ModelConfig:
     # is served elsewhere (mirrors SGLang --language-only).  Like tp_size,
     # this describes the deployed worker, not the model: vision tokens still
     # extend the context; the ViT ops are simply not hosted here.
-    language_only: bool = False
+    # None is omission: families retain tower residency unless their validated
+    # execution profile explicitly selects a tower-free baseline. False is an
+    # explicit residency request and must never be reinterpreted as True.
+    language_only: bool | None = None
     # quantization options
     # MTP speculative decoding: draft length (compute/verification cost only).
     # Accepted-token progress belongs to the upper prediction/simulation layer.
@@ -150,6 +153,72 @@ class ModelConfig:
     # Selection emits a warning with the original model mode and matched cell IDs.
     # Exact table-label matching is not independent runtime-precision proof.
     fpm_fmha_quant_mode: common.FMHAQuantMode | None = field(default=None, kw_only=True)
+    execution_profile: str | None = field(default=None, kw_only=True)
+
+    def resolve_execution_profile(self, model_path: str, model_family: str, backend_name: str) -> None:
+        """Apply the Rust-owned identity at the model-composition boundary.
+
+        Constructors that bypass get_model must call this too, before inventory
+        or graph construction. Other families retain the historical False default.
+        """
+        from aisimulate_core.sdk.errors import InvalidEngineConfigurationError
+
+        if self.language_only is not None and type(self.language_only) is not bool:
+            raise InvalidEngineConfigurationError("language_only must be a boolean or None")
+        if model_family != "GLM5NEXT" and self.execution_profile is None:
+            if self.language_only is None:
+                self.language_only = False
+            return
+        import json
+
+        import aisimulate_core
+
+        request = {
+            "model": model_path,
+            "system": self.system or "__model_composition__",
+            "backend": backend_name,
+            "worker_type": "aggregated",
+            "execution_profile": self.execution_profile,
+            "tp": self.tp_size,
+            "pp": self.pp_size,
+            "attention_dp": self.attention_dp_size,
+            "moe_tp_size": self.moe_tp_size,
+            "moe_ep_size": self.moe_ep_size,
+            "nextn": self.nextn,
+            "decoder_replay": self.decoder_replay,
+            "enable_eplb": self.enable_eplb,
+            "wideep_num_slots": self.wideep_num_slots,
+            "moe_backend": self.moe_backend,
+            "attention_backend": self.attention_backend,
+            "estimation_mode": "fpm_interpolation" if self.forward_model == "fpm" else "op_level",
+            **{
+                name: getattr(self, name).name if getattr(self, name) is not None else None
+                for name in (
+                    "gemm_quant_mode",
+                    "moe_quant_mode",
+                    "fmha_quant_mode",
+                    "kvcache_quant_mode",
+                    "comm_quant_mode",
+                )
+            },
+        }
+        try:
+            resolved = json.loads(
+                aisimulate_core.RustForwardPassPerfModel.normalize_config(json.dumps(request), model_family)
+            )
+        except ValueError as exc:
+            raise InvalidEngineConfigurationError(str(exc)) from exc
+        if resolved["execution_profile"] is not None:
+            if self.language_only is False:
+                raise InvalidEngineConfigurationError(
+                    "glm5_next_text_tp_v1 requires language_only=True; tower residency is not modeled"
+                )
+            if self.cp_size != 1 or self.cp_style != "none":
+                raise InvalidEngineConfigurationError("glm5_next_text_tp_v1 requires CP=1 and no sequence parallelism")
+            self.language_only = True
+        self.execution_profile = resolved["execution_profile"]
+        self.moe_tp_size = resolved["moe_tp_size"]
+        self.moe_ep_size = resolved["moe_ep_size"]
 
     def __post_init__(self) -> None:
         self.moe_backend = normalize_kernel_backend(self.moe_backend, common.MoEBackend, "moe_backend")

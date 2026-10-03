@@ -50,7 +50,10 @@ pub use elementwise::ElementwiseOp;
 pub use embedding::EmbeddingOp;
 pub use fpm_forward::{FpmForwardOp, FpmPhase};
 pub use gemm::GemmOp;
-pub use glm5_next::{Glm5NextKdaOp, Glm5NextMhcOp, Glm5NextSparseAttentionOp};
+#[allow(unused_imports)]
+pub use glm5_next::{
+    Glm5NextFp32LinearOp, Glm5NextKdaOp, Glm5NextMhcOp, Glm5NextSparseAttentionOp,
+};
 pub use mamba::{GdnOp, KdaOp, Mamba2Op};
 pub use mhc::MhcModuleOp;
 pub use mla::{ContextMlaOp, GenerationMlaOp, MlaBmmOp, MlaModuleOp};

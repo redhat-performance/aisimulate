@@ -37,7 +37,7 @@ fn invalid(message: &str) -> AicError {
     AicError::InvalidEngineConfig(format!("GLM5NEXT: {message}"))
 }
 
-fn validate_scale(scale: f64) -> Result<(), AicError> {
+pub(crate) fn validate_scale(scale: f64) -> Result<(), AicError> {
     if !scale.is_finite() || scale < 0.0 {
         return Err(invalid("num/scale_factor must be finite and nonnegative"));
     }
@@ -48,6 +48,53 @@ pub(crate) fn mode_ready(mode: DatabaseMode) -> Result<(), AicError> {
     if mode == DatabaseMode::Silicon {
         return Err(AicError::PerfDatabase(
             "GLM5NEXT has no measured SILICON data; use SOL or explicitly accept the analytical, unvalidated HYBRID/EMPIRICAL fallback".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn fp32_flops(spec: &SystemSpec) -> Result<f64, AicError> {
+    spec.gpu
+        .fp32_flops
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .ok_or_else(|| {
+            AicError::MissingSystemFlops(
+                "GLM5NEXT needs finite positive scalar fp32_flops, not BF16 tensor-core throughput"
+                    .into(),
+            )
+        })
+}
+
+/// Workload-independent dependencies, not a synthetic shape/coverage probe.
+/// Sparse attention alone also consumes BF16 and FP8 tensor-core rates.
+pub(crate) fn hardware_ready(db: &PerfDatabase, sparse: bool) -> Result<(), AicError> {
+    mode_ready(db.database_mode)?;
+    let spec = &db.system_spec;
+    fp32_flops(spec)?;
+    positive(spec.gpu.mem_bw, "mem_bw")?;
+    if sparse {
+        quant_tc_flops(spec, GemmQuantMode::Bfloat16.mapping())?;
+        quant_tc_flops(spec, GemmQuantMode::Fp8.mapping())?;
+    }
+    if !matches!(db.database_mode, DatabaseMode::Sol | DatabaseMode::SolFull) {
+        positive(
+            spec.gpu.mem_bw_empirical_scaling_factor,
+            "memory efficiency",
+        )?;
+        let overhead = spec.gpu.mem_empirical_constant_latency;
+        if !overhead.is_finite() || overhead < 0.0 {
+            return Err(invalid(
+                "memory latency constant must be finite and nonnegative",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_phase(is_context: bool, batch: u32, s: u32) -> Result<(), AicError> {
+    if !is_context && batch > 0 && s == 0 {
+        return Err(invalid(
+            "scheduled decode requires a positive inclusive sequence length",
         ));
     }
     Ok(())
@@ -110,12 +157,7 @@ fn evaluate(
             }
         }
         if stage.fp32 > 0.0 {
-            let rate = spec.gpu.fp32_flops.ok_or_else(|| {
-                AicError::MissingSystemFlops(
-                    "GLM5NEXT needs scalar fp32_flops, not BF16 tensor-core throughput".into(),
-                )
-            })?;
-            seconds += stage.fp32 / positive(rate, "fp32_flops")?;
+            seconds += stage.fp32 / fp32_flops(spec)?;
         }
         let components = SolComponents::new(seconds * 1000.0, stage.bytes / bandwidth * 1000.0);
         let leaf = if sol {
@@ -215,6 +257,7 @@ impl Glm5NextSparseAttentionOp {
 
     fn work(&self, batch: u32, s: u32, prefix: u32) -> Result<Vec<Work>, AicError> {
         self.validate()?;
+        validate_phase(self.is_context, batch, s)?;
         if !self.is_context && prefix != 0 {
             return Err(invalid(
                 "decode s is total sequence length; prefix must be zero",
@@ -318,6 +361,16 @@ impl Glm5NextSparseAttentionOp {
         if ctx.beam_width != 1 {
             return Err(invalid("sparse attention supports beam_width=1 only"));
         }
+        let correction = if self.is_context {
+            ctx.seq_imbalance_correction_scale
+        } else {
+            ctx.gen_seq_imbalance_correction_scale
+        };
+        if correction != 1.0 {
+            return Err(invalid(
+                "sparse attention imbalance correction is unsupported; scale must be 1",
+            ));
+        }
         let stages = self.work(ctx.batch_size, ctx.s, ctx.prefix)?;
         query_result(db, &stages, self.scale_factor)
     }
@@ -413,6 +466,7 @@ impl Glm5NextKdaOp {
 
     fn work(&self, ctx: &RuntimeContext) -> Result<Vec<Work>, AicError> {
         self.validate()?;
+        validate_phase(self.is_context, ctx.batch_size, ctx.s)?;
         if ctx.beam_width != 1 || (!self.is_context && ctx.prefix != 0) {
             return Err(invalid(
                 "KDA supports non-speculative beam_width=1; decode prefix must be zero",
@@ -516,6 +570,89 @@ impl Glm5NextFp32LinearOp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kda_zero_length_is_phase_aware_and_recurrence_is_length_independent() {
+        let mut op = Glm5NextKdaOp {
+            name: "kda".into(),
+            scale_factor: 1.0,
+            is_context: false,
+            num_heads: 1,
+            head_dim: 128,
+            conv_kernel: 4,
+        };
+        let mut ctx = RuntimeContext {
+            s: 0,
+            ..Default::default()
+        };
+        assert!(matches!(
+            op.work(&ctx),
+            Err(AicError::InvalidEngineConfig(_))
+        ));
+        ctx.batch_size = 0;
+        assert!(op.work(&ctx).unwrap().is_empty());
+        ctx.batch_size = 1;
+        op.is_context = true;
+        assert!(op.work(&ctx).unwrap().is_empty());
+        op.is_context = false;
+        ctx.s = 1;
+        let first = op.work(&ctx).unwrap();
+        // One 128x128 head: recurrence performs 6*16384 + 8*128
+        // scalar operations even for the first scheduled token.
+        assert_eq!(first[1].fp32, 99_328.0);
+        ctx.s = 2049;
+        let later = op.work(&ctx).unwrap();
+        assert_eq!(first[1].fp32, later[1].fp32);
+        assert_eq!(first[1].bytes, later[1].bytes);
+    }
+
+    #[test]
+    fn sparse_imbalance_is_fail_closed_and_only_checks_its_phase() {
+        use crate::common::enums::TransferPolicy;
+        let root = tempfile::tempdir().unwrap();
+        crate::perf_database::energy_test_fixtures::write_energy_systems_root(root.path());
+        let mut db = PerfDatabase::load(root.path(), "testsys", "vllm", "1.0")
+            .unwrap()
+            .with_mode(DatabaseMode::Sol, TransferPolicy::ALL);
+        db.tables_mut().system_spec.gpu.fp32_flops = Some(1e12);
+        let mut op = Glm5NextSparseAttentionOp {
+            name: "sparse".into(),
+            scale_factor: 1.0,
+            is_context: true,
+            num_heads: 1,
+            kv_lora_rank: 512,
+            qk_head_dim: 256,
+            v_head_dim: 256,
+            index_n_heads: 32,
+            index_head_dim: 128,
+            index_topk: 2048,
+            index_kpool: 4,
+        };
+        for context in [true, false] {
+            op.is_context = context;
+            for bad in [0.0, 2.0, -1.0, f64::NAN, f64::INFINITY] {
+                let mut ctx = RuntimeContext::default();
+                if context {
+                    ctx.seq_imbalance_correction_scale = bad;
+                } else {
+                    ctx.gen_seq_imbalance_correction_scale = bad;
+                }
+                assert!(matches!(
+                    op.query(&db, &ctx),
+                    Err(AicError::InvalidEngineConfig(_))
+                ));
+            }
+            let mut ctx = RuntimeContext::default();
+            if context {
+                ctx.gen_seq_imbalance_correction_scale = 2.0;
+            } else {
+                ctx.seq_imbalance_correction_scale = 2.0;
+            }
+            assert!(op.query(&db, &ctx).unwrap().latency_ms > 0.0);
+        }
+        assert!(op.work(1, 0, 0).is_err());
+        assert!(op.work(0, 0, 0).unwrap().is_empty());
+    }
 
     #[test]
     fn fp32_projection_has_independent_numerical_roofline() {

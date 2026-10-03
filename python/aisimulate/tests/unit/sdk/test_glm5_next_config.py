@@ -9,6 +9,8 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from aisimulate_core.sdk import common, utils
+from aisimulate_core.sdk.errors import InvalidEngineConfigurationError
+from aisimulate_core.sdk.glm5_next import parse_glm5_next_config
 
 pytestmark = pytest.mark.unit
 MODEL = "zai-org/GLM-5.3-Flash"
@@ -63,7 +65,7 @@ def test_pinned_geometry_and_immutable_contract(raw):
 @pytest.mark.parametrize("value", [None, [], "text", 0])
 def test_invalid_nested_text(raw, value):
     raw["text_config"] = value
-    with pytest.raises(ValueError, match="text_config"):
+    with pytest.raises(InvalidEngineConfigurationError, match="text_config"):
         utils._parse_hf_config_json(raw)
 
 
@@ -102,7 +104,7 @@ REQUIRED_INTS = (
 @pytest.mark.parametrize("value", [None, 0, -1, True, 1.5, "64", [], {}])
 def test_invalid_positive_integers(raw, field, value):
     raw["text_config"][field] = value
-    with pytest.raises(ValueError, match=field):
+    with pytest.raises(InvalidEngineConfigurationError, match=field):
         utils._parse_hf_config_json(raw)
 
 
@@ -124,7 +126,7 @@ def test_invalid_positive_integers(raw, field, value):
 )
 def test_missing_fields(raw, field):
     del raw["text_config"][field]
-    with pytest.raises(ValueError, match=field):
+    with pytest.raises(InvalidEngineConfigurationError, match=field):
         utils._parse_hf_config_json(raw)
 
 
@@ -132,7 +134,7 @@ def test_missing_fields(raw, field):
 @pytest.mark.parametrize("value", [None, "linear_attention", [], ["dense"] * 44, ["bad"] * 45, [{}] * 45])
 def test_invalid_plans(raw, field, value):
     raw["text_config"][field] = value
-    with pytest.raises(ValueError, match=field):
+    with pytest.raises(InvalidEngineConfigurationError, match=field):
         utils._parse_hf_config_json(raw)
 
 
@@ -140,7 +142,7 @@ def test_invalid_plans(raw, field, value):
 @pytest.mark.parametrize("value", [None, "0", [], [-1], [45], [True], [0.0], ["0"], [[0]], [0, 0]])
 def test_invalid_zero_based_layer_ids(raw, field, value):
     raw["text_config"]["linear_attn_config"][field] = value
-    with pytest.raises(ValueError, match=field):
+    with pytest.raises(InvalidEngineConfigurationError, match=field):
         utils._parse_hf_config_json(raw)
 
 
@@ -171,7 +173,7 @@ def test_rejects_one_based_kda_plan(raw):
 )
 def test_inconsistent_or_invalid_geometry(raw, field, value, match):
     raw["text_config"][field] = value
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(InvalidEngineConfigurationError, match=match):
         utils._parse_hf_config_json(raw)
 
 
@@ -179,7 +181,7 @@ def test_inconsistent_or_invalid_geometry(raw, field, value, match):
 @pytest.mark.parametrize("value", [None, 0, -1, True, "128", 1.5])
 def test_invalid_kda_geometry(raw, field, value):
     raw["text_config"]["linear_attn_config"][field] = value
-    with pytest.raises(ValueError, match=field):
+    with pytest.raises(InvalidEngineConfigurationError, match=field):
         utils._parse_hf_config_json(raw)
 
 
@@ -196,7 +198,7 @@ def test_invalid_kda_geometry(raw, field, value):
 )
 def test_invalid_quantization(raw, value):
     raw["quantization_config"] = value
-    with pytest.raises(ValueError, match="quantization_config|weight_block_size"):
+    with pytest.raises(InvalidEngineConfigurationError, match="quantization_config|weight_block_size"):
         utils._parse_hf_config_json(raw)
 
 
@@ -230,7 +232,7 @@ def test_no_fabricated_silicon_support():
 @pytest.mark.parametrize("value", [None, -1, True, "0", 0.5, []])
 def test_invalid_nonnegative_integers(raw, field, value):
     raw["text_config"][field] = value
-    with pytest.raises(ValueError, match=field):
+    with pytest.raises(InvalidEngineConfigurationError, match=field):
         utils._parse_hf_config_json(raw)
 
 
@@ -270,3 +272,32 @@ def test_all_catalog_configs_still_parse(model):
     info = utils.get_model_config_from_model_path(model)
     assert info["architecture"] in common.ARCHITECTURE_TO_MODEL_FAMILY
     assert info["layers"] > 0
+
+
+@pytest.mark.parametrize("value", [None, [], "config", 0])
+def test_direct_glm_parser_rejects_nonobjects_with_typed_error(value):
+    with pytest.raises(InvalidEngineConfigurationError, match="config must be an object"):
+        parse_glm5_next_config(value)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("index_head_dim", 64),
+        ("index_kpool", 1),
+        ("index_topk", 2049),
+        ("hidden_size", 2**32),
+        ("num_attention_heads", 2**32),
+    ],
+)
+def test_native_shape_prerequisites_rejected_before_graph_construction(raw, field, value):
+    raw["text_config"][field] = value
+    with pytest.raises(InvalidEngineConfigurationError, match=field):
+        utils._parse_hf_config_json(raw)
+
+
+@pytest.mark.parametrize("field,value", [("head_dim", 64), ("short_conv_kernel_size", 3)])
+def test_native_kda_prerequisites_rejected_before_graph_construction(raw, field, value):
+    raw["text_config"]["linear_attn_config"][field] = value
+    with pytest.raises(InvalidEngineConfigurationError, match="KDA requires"):
+        utils._parse_hf_config_json(raw)

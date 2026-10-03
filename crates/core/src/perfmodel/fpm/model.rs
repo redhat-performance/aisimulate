@@ -312,7 +312,7 @@ impl ForwardPassPerfModel {
     /// fallback is denied; explicit modes use the requested fallback policy.
     /// A regression model may be constructed before it has enough observations.
     pub fn best_available(mut config: ForwardPassPerfModelConfig) -> Result<Self, AicError> {
-        config.validate()?;
+        config.resolve_identity()?;
         if let Some(path) = config
             .estimator_config
             .fpm_interpolation
@@ -327,6 +327,14 @@ impl ForwardPassPerfModel {
         let mut failures = Vec::new();
         let mut last_error = None;
         for mode in config.candidate_modes() {
+            if config.execution_profile.is_some() && mode == EstimationMode::FpmInterpolation {
+                let error = AicError::UnsupportedModel(
+                    "glm5_next_text_tp_v1 requires profile-keyed FPM interpolation data".into(),
+                );
+                failures.push(format!("{mode:?}: {error}"));
+                last_error = Some(error);
+                continue;
+            }
             if config.speculation.is_some() && mode != EstimationMode::OpLevel {
                 let error =
                     AicError::UnsupportedModel("ngram speculation requires op_level timing".into());

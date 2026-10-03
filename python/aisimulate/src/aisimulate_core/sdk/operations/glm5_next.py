@@ -52,3 +52,12 @@ class Glm5NextKDA(_core.Glm5NextKDA, OpShellKit):
     parameters stay outside (get_weights=0). Avoids KDAKernel's nearest-Kimi
     shape selection and its different fused-decode boundary. No speculation.
     """
+
+
+class Glm5NextFp32Linear(_core.Glm5NextFp32Linear, OpShellKit):
+    """Scalar FP32 projection: (name, num, n, k).
+
+    Native geometry/validation, FP32 parameter residency and token-major
+    evaluation. JSON reconstruction, pickle and deepcopy retain this family;
+    never substitute BF16 tensor-core throughput for scalar FP32 arithmetic.
+    """
