@@ -765,6 +765,40 @@ mod tests {
                 k: 5120,
                 quant_mode: GemmQuantMode::Fp8Block,
             }),
+            OpSpec::Glm5NextSparseAttention(crate::operators::Glm5NextSparseAttentionOp {
+                name: "glm5_sparse".into(),
+                scale_factor: 11.0,
+                is_context: true,
+                num_heads: 16,
+                kv_lora_rank: 512,
+                qk_head_dim: 256,
+                v_head_dim: 256,
+                index_n_heads: 32,
+                index_head_dim: 128,
+                index_topk: 2048,
+                index_kpool: 4,
+            }),
+            OpSpec::Glm5NextMhc(crate::operators::Glm5NextMhcOp {
+                name: "glm5_mhc".into(),
+                scale_factor: 90.0,
+                hidden_size: 4096,
+                hc_mult: 4,
+                hc_sinkhorn_iters: 20,
+            }),
+            OpSpec::Glm5NextKda(crate::operators::Glm5NextKdaOp {
+                name: "glm5_kda".into(),
+                scale_factor: 34.0,
+                is_context: false,
+                num_heads: 16,
+                head_dim: 128,
+                conv_kernel: 4,
+            }),
+            OpSpec::Glm5NextFp32Linear(crate::operators::glm5_next::Glm5NextFp32LinearOp {
+                name: "glm5_fp32".into(),
+                scale_factor: 42.0,
+                n: 288,
+                k: 4096,
+            }),
         ];
 
         // Exhaustiveness guard: if a variant is added to `Op`, this match
@@ -811,6 +845,10 @@ mod tests {
                 | OpSpec::Dsv41Engram(_)
                 | OpSpec::Dsv41Stage(_)
                 | OpSpec::Dsv41Linear(_)
+                | OpSpec::Glm5NextSparseAttention(_)
+                | OpSpec::Glm5NextMhc(_)
+                | OpSpec::Glm5NextKda(_)
+                | OpSpec::Glm5NextFp32Linear(_)
                 | OpSpec::TokenScale(_) => {}
             }
         }
@@ -909,11 +947,11 @@ mod tests {
         let appended: Vec<_> = all_op_variants().iter().skip(36).map(index_of).collect();
         assert_eq!(
             appended,
-            vec![36, 37, 38, 39, 40],
-            "V41 appended indices moved"
+            vec![36, 37, 38, 39, 40, 41, 42, 43, 44],
+            "V41/GLM5NEXT appended indices moved"
         );
         assert_eq!(
-            TOKEN_SCALE_INDEX as usize + 6,
+            TOKEN_SCALE_INDEX as usize + 10,
             all_op_variants().len(),
             "all_op_variants() must cover exactly the pinned variant count"
         );

@@ -13,6 +13,59 @@ distributed with those packages.
 Unless otherwise stated, AISimulate file paths in this document are relative
 to `python/aisimulate/` in the repository source tree.
 
+## GLM-5.3-Flash configuration and serving contracts
+
+The modified offline fixture
+`src/aisimulate_core/model_configs/zai-org--GLM-5.3-Flash_config.json`, its adjacent
+README, `src/aisimulate_core/sdk/glm5_next.py`, the `Glm5NextConfig` descriptor
+in `sdk/common.py`, parser integration in `sdk/utils.py`, and their tests derive
+geometry from `config.json` in `zai-org/GLM-5.3-Flash` at immutable revision
+`eb9eb208eb0d988989d07a6a12d0fdeb5f52574a`:
+https://huggingface.co/zai-org/GLM-5.3-Flash/tree/eb9eb208eb0d988989d07a6a12d0fdeb5f52574a
+
+Copyright (c) 2026 Z.AI Co., Ltd. MIT licensed; the fixture is reformatted with
+losslessly grouped quantization exclusions. The upstream license is preserved
+verbatim in the adjacent fixture README and reproduced below.
+
+The model/operation descriptions in `src/aisimulate_core/sdk/models/glm5_next.py`,
+`src/aisimulate_core/sdk/operations/glm5_next.py`, repository-root
+`crates/core/src/perfmodel/operators/glm5_next.rs`, their native wiring and tests,
+and `docs/glm5-next.md` are modified analytical adaptations of vLLM's serving
+contracts (not GPU kernel copies) at immutable revision
+`0a30bc3f9ac3cc1a9339e115377a99d32252aed0`:
+https://github.com/vllm-project/vllm/tree/0a30bc3f9ac3cc1a9339e115377a99d32252aed0
+
+Original paths: `vllm/models/glm5next/common/{model,kda,attention,sparse_indexer}.py`,
+`vllm/models/glm5next/nvidia/sparse_indexer.py`, and
+`vllm/model_executor/layers/mamba/mamba_utils.py`, and
+`vllm/model_executor/layers/fused_moe/router/gate_linear.py`. Copyright contributors to
+the vLLM project. Licensed under Apache-2.0 (the license text is reproduced
+in this distribution's LICENSE); this revision has no root NOTICE file.
+
+```text
+MIT License
+
+Copyright (c) 2026 Z.AI Co., Ltd
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 ## AIConfigurator
 
 The repository-root `.coderabbit.yaml` is adapted and modified from

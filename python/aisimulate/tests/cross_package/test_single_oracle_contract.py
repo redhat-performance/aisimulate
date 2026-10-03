@@ -195,6 +195,8 @@ OPERATIONS_DEF_INVENTORY = {
     ),
     "elementwise.py": frozenset(),
     "embedding.py": frozenset(),
+    # Native subclasses only: no Python latency, geometry or query definitions.
+    "glm5_next.py": frozenset(),
     "fpm_forward.py": frozenset(
         {
             "FPMForwardOp.__init__",

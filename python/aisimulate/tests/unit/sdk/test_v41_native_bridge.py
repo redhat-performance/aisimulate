@@ -139,7 +139,7 @@ def test_compile_engine_resolves_v41_native_expert_lane(monkeypatch):
 
 @pytest.mark.parametrize(
     ("config_text", "cause_type"),
-    [(None, ValueError), ("{", ValueError), ("{}", KeyError), ('{"architectures": null}', TypeError)],
+    [(None, ValueError), ("{", ValueError), ("{}", ValueError), ('{"architectures": null}', ValueError)],
 )
 def test_compile_engine_classifies_invalid_resolver_metadata(tmp_path, config_text, cause_type):
     from aisimulate_core.sdk.engine import compile_engine
@@ -150,6 +150,10 @@ def test_compile_engine_classifies_invalid_resolver_metadata(tmp_path, config_te
     with pytest.raises(InvalidEngineConfigurationError) as caught:
         compile_engine(str(tmp_path), "gb300", "sglang")
     assert isinstance(caught.value.__cause__, cause_type)
+    if config_text in ("{}", '{"architectures": null}'):
+        assert str(caught.value.__cause__) == (
+            "Model config architectures must be a non-empty list of non-empty strings"
+        )
     # The canonical Rust constructor must retain the hard configuration error
     # instead of interpreting this as UnsupportedModel and trying fallback.
     with pytest.raises(ValueError, match="invalid engine config:"):

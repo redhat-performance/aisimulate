@@ -320,16 +320,25 @@ class BaseBackend:
             get_vision_encoder_config_from_model_info,
         )
 
+        model_info = {}
         try:
             model_info = get_model_config_from_model_path(model_path)
             enc_cfg = get_vision_encoder_config_from_model_info(model_info)
         except Exception:
             logger.debug("Could not resolve model config for the effective ISL; using text ISL", exc_info=True)
             enc_cfg = None
+        if model_info.get("architecture") == "Glm5NextForConditionalGeneration":
+            from aisimulate_core.sdk.glm5_next import validate_glm5_next_text_workload
+
+            validate_glm5_next_text_workload(runtime_config)
         return runtime_config.isl + BaseBackend._visual_context_tokens_from_encoder_config(enc_cfg, runtime_config)
 
     @staticmethod
     def _visual_context_tokens(model: BaseModel, runtime_config: RuntimeConfig) -> int:
+        if getattr(model, "model_family", None) == "GLM5NEXT":
+            from aisimulate_core.sdk.glm5_next import validate_glm5_next_text_workload
+
+            validate_glm5_next_text_workload(runtime_config)
         return BaseBackend._visual_context_tokens_from_encoder_config(
             getattr(model, "encoder_config", None), runtime_config
         )
@@ -649,6 +658,10 @@ class BaseBackend:
 
         enc_cfg = getattr(model, "encoder_config", None)
         if not model.encoder_ops or not isinstance(enc_cfg, common.VisionEncoderConfig):
+            if getattr(model, "model_family", None) == "GLM5NEXT":
+                from aisimulate_core.sdk.glm5_next import validate_glm5_next_text_workload
+
+                validate_glm5_next_text_workload(runtime_config)
             # Reuse the visual-input guard so a configured video can never
             # degrade silently to a text-only estimate on an unsupported model.
             self._visual_context_tokens_from_encoder_config(enc_cfg, runtime_config)

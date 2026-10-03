@@ -973,6 +973,8 @@ def test_forward_pass_config_requires_role_and_defaults_to_auto_deny() -> None:
 
 
 def test_forward_pass_config_preserves_existing_positional_arguments(tmp_path: Path) -> None:
+    from inspect import Parameter, signature
+
     from aisimulate_core.sdk import ForwardPassPerfModelConfig
 
     # Positional order frozen from main at e8828036e3d3, before moe_kernel_source was added.
@@ -1009,13 +1011,27 @@ def test_forward_pass_config_preserves_existing_positional_arguments(tmp_path: P
         "enable_eplb": True,
         "wideep_num_slots": 64,
     }
+    added_defaults = {
+        "fpm_fmha_quant_mode": None,
+        "moe_kernel_source": None,
+        "execution_profile": None,
+        "model_family": None,
+    }
+    parameters = signature(ForwardPassPerfModelConfig).parameters
+    for field in ("execution_profile", "model_family"):
+        assert parameters[field].kind is Parameter.KEYWORD_ONLY
+        assert parameters[field].default is None
     config = ForwardPassPerfModelConfig(*legacy_fields.values())
-    assert vars(config) == {**legacy_fields, "fpm_fmha_quant_mode": None, "moe_kernel_source": None}
+    assert vars(config) == {**legacy_fields, **added_defaults}
 
     source = " source_with_spaces "
     pinned = ForwardPassPerfModelConfig(*legacy_fields.values(), moe_kernel_source=source)
-    assert vars(pinned) == {**legacy_fields, "fpm_fmha_quant_mode": None, "moe_kernel_source": source}
+    assert vars(pinned) == {**legacy_fields, **added_defaults, "moe_kernel_source": source}
     assert json.loads(json.dumps(pinned.to_dict()))["moe_kernel_source"] == source
+    for instance in (config, pinned):
+        serialized = json.loads(json.dumps(instance.to_dict()))
+        assert "execution_profile" not in serialized
+        assert "model_family" not in serialized
 
 
 def _supported_fpm_config() -> dict[str, object]:

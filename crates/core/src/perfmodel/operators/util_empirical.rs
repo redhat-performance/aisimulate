@@ -66,6 +66,9 @@ pub enum ProvenanceTier {
     XProfile = 4,
     /// Cross-op (borrowed a different op's util).
     XOp = 5,
+    /// Tableless analytical inventory with declared, uncalibrated assumptions.
+    /// Not an own-shape or transferred measured utilization sample.
+    AnalyticUnvalidated = 6,
 }
 
 impl ProvenanceTier {
@@ -78,6 +81,7 @@ impl ProvenanceTier {
             ProvenanceTier::XQuant => "xquant",
             ProvenanceTier::XProfile => "xprofile",
             ProvenanceTier::XOp => "xop",
+            ProvenanceTier::AnalyticUnvalidated => "analytic_unvalidated",
         }
     }
 
@@ -92,6 +96,7 @@ impl ProvenanceTier {
             "xquant" => Some(ProvenanceTier::XQuant),
             "xprofile" => Some(ProvenanceTier::XProfile),
             "xop" => Some(ProvenanceTier::XOp),
+            "analytic_unvalidated" => Some(ProvenanceTier::AnalyticUnvalidated),
             _ => None,
         }
     }
@@ -105,7 +110,8 @@ impl ProvenanceTier {
             2 => ProvenanceTier::XShape,
             3 => ProvenanceTier::XQuant,
             4 => ProvenanceTier::XProfile,
-            _ => ProvenanceTier::XOp,
+            5 => ProvenanceTier::XOp,
+            _ => ProvenanceTier::AnalyticUnvalidated,
         }
     }
 }
@@ -1113,6 +1119,11 @@ mod tests {
             (ProvenanceTier::XQuant, 3, "xquant"),
             (ProvenanceTier::XProfile, 4, "xprofile"),
             (ProvenanceTier::XOp, 5, "xop"),
+            (
+                ProvenanceTier::AnalyticUnvalidated,
+                6,
+                "analytic_unvalidated",
+            ),
         ];
         for (tier, rank, tag) in tiers {
             assert_eq!(tier as u8, rank);
@@ -1121,9 +1132,12 @@ mod tests {
             assert_eq!(ProvenanceTier::from_tag(tag), Some(tier));
         }
         assert_eq!(ProvenanceTier::from_tag("unknown"), None);
-        // max-rank == worst_provenance semantics; overflow clamps to XOp.
+        // max-rank == worst_provenance semantics; overflow clamps to unvalidated.
         assert!(ProvenanceTier::XOp > ProvenanceTier::Empirical);
-        assert_eq!(ProvenanceTier::from_rank(200), ProvenanceTier::XOp);
+        assert_eq!(
+            ProvenanceTier::from_rank(200),
+            ProvenanceTier::AnalyticUnvalidated
+        );
     }
 
     #[test]

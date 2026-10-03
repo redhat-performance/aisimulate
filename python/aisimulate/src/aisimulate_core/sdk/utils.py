@@ -32,6 +32,7 @@ from aisimulate_core.sdk.common import (
     Qwen35Config,
     VisionEncoderConfig,
 )
+from aisimulate_core.sdk.glm5_next import expand_bundled_glm5_next_config, parse_glm5_next_config
 
 logger = logging.getLogger(__name__)
 
@@ -867,7 +868,18 @@ def _parse_hf_config_json(config: dict) -> dict:
     Raises:
         ValueError: If a required field is missing from the config or the architecture is not supported
     """
-    architecture = config["architectures"][0]
+    if not isinstance(config, dict):
+        raise ValueError("Model config must be an object")
+    architectures = config.get("architectures")
+    if (
+        not isinstance(architectures, list)
+        or not architectures
+        or any(not isinstance(value, str) or not value for value in architectures)
+    ):
+        raise ValueError("Model config architectures must be a non-empty list of non-empty strings")
+    architecture = architectures[0]
+    if architecture == "Glm5NextForConditionalGeneration":
+        return parse_glm5_next_config(config)
     vision_cfg = config.get("vision_config")
     vision_soft_tokens_per_image = config.get("vision_soft_tokens_per_image")
     processor_cfg = config.get("preprocessor_config")
@@ -1520,7 +1532,7 @@ def _load_pre_downloaded_hf_config(hf_id: str) -> dict:
     config_path = _get_model_config_path() / f"{hf_id.replace('/', '--')}_config.json"
     if not config_path.exists():
         raise ValueError(f"HuggingFace model {hf_id} is not cached in model_configs directory.")
-    return _load_json_with_infinity(config_path)
+    return expand_bundled_glm5_next_config(_load_json_with_infinity(config_path))
 
 
 def _load_pre_downloaded_hf_quant_config(hf_id: str) -> dict | None:

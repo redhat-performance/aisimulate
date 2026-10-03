@@ -52,6 +52,39 @@ pub enum ForwardPassFallbackPolicy {
     LegacyRegression,
 }
 
+/// Versioned execution assumptions, not a timing-data/backend version.
+/// V1 excludes vision/MTP residency, forces sparse MQA, disables sequence
+/// parallelism and permits no prefix checkpoint retention or cache offload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForwardPassExecutionProfile {
+    #[serde(rename = "glm5_next_text_tp_v1")]
+    Glm5NextTextTpV1,
+}
+
+impl ForwardPassExecutionProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Glm5NextTextTpV1 => "glm5_next_text_tp_v1",
+        }
+    }
+}
+
+/// Family evidence retained with a resolved family-specific execution profile.
+/// Metadata discovery cross-checks this identity whenever it is available.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForwardPassModelFamily {
+    #[serde(rename = "GLM5NEXT")]
+    Glm5Next,
+}
+
+impl ForwardPassModelFamily {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Glm5Next => "GLM5NEXT",
+        }
+    }
+}
+
 /// Target-verification cost; acceptance and scheduler progress belong to replay.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -153,9 +186,20 @@ pub struct ForwardPassPerfModelConfig {
     pub enable_shared_layer: Option<bool>,
     #[serde(default)]
     pub strict_provenance: bool,
+    /// Resolved immutable runtime identity. Absent legacy GLM requests infer V1.
+    #[serde(default)]
+    pub execution_profile: Option<ForwardPassExecutionProfile>,
+    /// Resolved family identity, preserved when metadata cannot be rediscovered.
+    #[serde(default)]
+    pub model_family: Option<ForwardPassModelFamily>,
 }
 
 impl ForwardPassPerfModelConfig {
+    /// Typed profile token for Rust callers without requiring a facade re-export.
+    pub const GLM5_NEXT_TEXT_TP_V1: ForwardPassExecutionProfile =
+        ForwardPassExecutionProfile::Glm5NextTextTpV1;
+    pub const GLM5_NEXT_FAMILY: ForwardPassModelFamily = ForwardPassModelFamily::Glm5Next;
+
     pub fn new(
         model: impl Into<String>,
         system: impl Into<String>,
@@ -196,7 +240,83 @@ impl ForwardPassPerfModelConfig {
             moe_kernel_source: None,
             enable_shared_layer: None,
             strict_provenance: false,
+            execution_profile: None,
+            model_family: None,
         }
+    }
+
+    /// Metadata is authoritative for alternate/local checkpoints. The bundled
+    /// name also resolves without Python, including regression-only consumers.
+    pub fn resolve_execution_profile(
+        &mut self,
+        model_family: Option<&str>,
+    ) -> Result<(), AicError> {
+        if model_family.is_some_and(|family| family != "GLM5NEXT")
+            && (self.model_family.is_some() || self.execution_profile.is_some())
+        {
+            return Err(invalid_config(format!(
+                "execution_profile/model_family requires GLM5NEXT metadata/family; discovered {}",
+                model_family.unwrap()
+            )));
+        }
+        let is_glm = model_family.map_or(
+            self.model == "zai-org/GLM-5.3-Flash" || self.model_family.is_some(),
+            |family| family == "GLM5NEXT",
+        );
+        if is_glm {
+            self.model_family = Some(ForwardPassModelFamily::Glm5Next);
+            self.execution_profile
+                .get_or_insert(ForwardPassExecutionProfile::Glm5NextTextTpV1);
+            match (self.moe_tp_size, self.moe_ep_size) {
+                (None, None) => {
+                    self.moe_tp_size = Some(self.tp);
+                    self.moe_ep_size = Some(1);
+                }
+                (Some(moe_tp), None) if moe_tp > 0 && self.tp % moe_tp == 0 => {
+                    self.moe_ep_size = Some(self.tp / moe_tp);
+                }
+                (None, Some(moe_ep)) if moe_ep > 0 && self.tp % moe_ep == 0 => {
+                    self.moe_tp_size = Some(self.tp / moe_ep);
+                }
+                (Some(_), Some(_)) => {}
+                _ => {
+                    return Err(invalid_config(
+                        "glm5_next_text_tp_v1 requires positive MoE dimensions dividing TP",
+                    ));
+                }
+            }
+        } else if self.execution_profile.is_some() {
+            return Err(invalid_config(
+                "execution_profile='glm5_next_text_tp_v1' requires GLM5NEXT metadata/family",
+            ));
+        }
+        self.validate()
+    }
+
+    /// Resolve metadata through the existing Python loader when available,
+    /// before selection so an invalid profile can never become a fallback.
+    pub(crate) fn resolve_identity(&mut self) -> Result<(), AicError> {
+        #[cfg(feature = "python")]
+        let family = discover_model_family(&self.model)?;
+        #[cfg(not(feature = "python"))]
+        let family: Option<String> = None;
+        self.resolve_execution_profile(family.as_deref())
+    }
+
+    /// Replay must explicitly disable its normally-enabled reusable cache.
+    /// Live per-request state reservation is independent and unchanged.
+    pub fn validate_replay_cache(
+        &self,
+        prefix_caching: bool,
+        host_retention: bool,
+        prefix_match: bool,
+    ) -> Result<(), AicError> {
+        if self.execution_profile.is_some() && (prefix_caching || host_retention || prefix_match) {
+            return Err(invalid_config(
+                "glm5_next_text_tp_v1 requires prefix_caching=false and rejects prefix retention, host/G3 offload and prefix_match_unit",
+            ));
+        }
+        Ok(())
     }
 
     pub fn candidate_modes(&self) -> Vec<EstimationMode> {
@@ -223,6 +343,65 @@ impl ForwardPassPerfModelConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<(), AicError> {
+        if self.execution_profile.is_some() {
+            if self.backend != BackendKind::Vllm
+                || !matches!(self.tp, 1 | 2 | 4 | 8)
+                || self.pp != 1
+                || self.attention_dp != 1
+                || self.moe_tp_size != Some(self.tp)
+                || self.moe_ep_size != Some(1)
+            {
+                return Err(invalid_config(
+                    "glm5_next_text_tp_v1 requires vllm, TP in {1,2,4,8}, PP=attention DP=1, MoE TP=TP and EP=1",
+                ));
+            }
+            if self.nextn != 0
+                || self.speculation.is_some()
+                || self.decoder_replay
+                || self.enable_eplb
+                || self.wideep_num_slots.is_some()
+                || self.attention_backend.is_some()
+                || self.moe_backend.as_deref().is_some_and(|v| v != "default")
+            {
+                return Err(invalid_config(
+                    "glm5_next_text_tp_v1 rejects speculation, decoder replay, EPLB, slots and attention/MoE backend overrides",
+                ));
+            }
+            if self.estimation_mode == EstimationMode::FpmInterpolation {
+                return Err(invalid_config(
+                    "glm5_next_text_tp_v1 cannot use FPM interpolation without profile-keyed data",
+                ));
+            }
+            for (name, value, expected) in [
+                (
+                    "gemm_quant_mode",
+                    self.gemm_quant_mode.as_deref(),
+                    "fp8_block",
+                ),
+                (
+                    "moe_quant_mode",
+                    self.moe_quant_mode.as_deref(),
+                    "fp8_block",
+                ),
+                (
+                    "fmha_quant_mode",
+                    self.fmha_quant_mode.as_deref(),
+                    "bfloat16",
+                ),
+                (
+                    "kvcache_quant_mode",
+                    self.kvcache_quant_mode.as_deref(),
+                    "bfloat16",
+                ),
+                ("comm_quant_mode", self.comm_quant_mode.as_deref(), "half"),
+            ] {
+                if value.is_some_and(|v| v != expected) {
+                    return Err(invalid_config(format!(
+                        "glm5_next_text_tp_v1 requires {name}={expected}"
+                    )));
+                }
+            }
+        }
         if self.model.trim().is_empty() {
             return Err(invalid_config("model cannot be empty"));
         }
@@ -346,6 +525,148 @@ impl ForwardPassPerfModelConfig {
         }
         self.estimator_config.validate()
     }
+}
+
+/// Only metadata availability/coverage gaps may retain an already-resolved
+/// family without rediscovery. Malformed metadata is never fallback-safe,
+/// including when an explicit regression estimator is requested.
+#[cfg(feature = "python")]
+fn discover_model_family(model: &str) -> Result<Option<String>, AicError> {
+    use pyo3::exceptions::{PyModuleNotFoundError, PyOSError, PyValueError};
+    use pyo3::prelude::*;
+
+    Python::with_gil(|py| {
+        let discovered = (|| -> PyResult<String> {
+            let architecture: String = py
+                .import("aisimulate_core.sdk.utils")?
+                .call_method1("get_model_config_from_model_path", (model,))?
+                .get_item("architecture")?
+                .extract()?;
+            Ok(if architecture == "Glm5NextForConditionalGeneration" {
+                "GLM5NEXT".to_owned()
+            } else {
+                architecture
+            })
+        })();
+        match discovered {
+            Ok(family) => Ok(Some(family)),
+            Err(error) => {
+                let is_kind = |module: &str, name: &str| {
+                    py.import(module)
+                        .and_then(|module| module.getattr(name))
+                        .is_ok_and(|kind| error.is_instance(py, &kind))
+                };
+                // Check the typed invalid-config subclass before ValueError or
+                // any availability recognizer so its classification survives.
+                if is_kind(
+                    "aisimulate_core.sdk.errors",
+                    "InvalidEngineConfigurationError",
+                ) {
+                    return Err(invalid_config(format!("model metadata: {error}")));
+                }
+                let message = error.value(py).to_string();
+                // Unsupported architectures still identify a contradictory
+                // family; do not treat that evidence as unavailable metadata.
+                if error.is_instance_of::<PyValueError>(py)
+                    && let Some((architecture, _)) = message
+                        .strip_prefix("The model's architecture ")
+                        .and_then(|value| value.split_once(" is not supported."))
+                {
+                    return Ok(Some(
+                        if architecture == "Glm5NextForConditionalGeneration" {
+                            "GLM5NEXT".to_owned()
+                        } else {
+                            architecture.to_owned()
+                        },
+                    ));
+                }
+                let unavailable_or_unsupported = error.is_instance_of::<PyOSError>(py)
+                    || error.is_instance_of::<PyModuleNotFoundError>(py)
+                    || is_kind("aisimulate_core.sdk.utils", "HuggingFaceDownloadError")
+                    || (error.is_instance_of::<PyValueError>(py)
+                        && (message.starts_with("config.json not found at ")
+                            || (message.starts_with("HuggingFace model ")
+                                && message
+                                    .ends_with(" is not cached in model_configs directory."))));
+                if unavailable_or_unsupported {
+                    validate_metadata_availability_chain(py, &error)?;
+                    Ok(None)
+                } else {
+                    Err(invalid_config(format!("model metadata: {error}")))
+                }
+            }
+        }
+    })
+}
+
+/// The SDK download wrapper also catches json.load/decoder failures. A wrapper
+/// is not availability evidence when its cause is corrupt metadata or a bug.
+/// Follow explicit causes first, otherwise unsuppressed implicit context, with
+/// a hard bound and identity-based cycle detection (never recursive traversal).
+#[cfg(feature = "python")]
+fn validate_metadata_availability_chain(
+    py: pyo3::Python<'_>,
+    error: &pyo3::PyErr,
+) -> Result<(), AicError> {
+    use pyo3::exceptions::{PyModuleNotFoundError, PyOSError, PyValueError};
+    use pyo3::prelude::*;
+    use std::collections::HashSet;
+
+    const MAX_CHAIN_LINKS: usize = 32;
+    let mut current = error.clone_ref(py);
+    let mut seen = HashSet::new();
+    for _ in 0..MAX_CHAIN_LINKS {
+        if !seen.insert(current.value(py).as_ptr() as usize) {
+            return Err(invalid_config("model metadata exception chain is cyclic"));
+        }
+        let is_kind = |module: &str, name: &str| {
+            py.import(module)
+                .and_then(|module| module.getattr(name))
+                .is_ok_and(|kind| current.is_instance(py, &kind))
+        };
+        let message = current.value(py).to_string();
+        let typed_invalid = is_kind(
+            "aisimulate_core.sdk.errors",
+            "InvalidEngineConfigurationError",
+        );
+        let available = current.is_instance_of::<PyOSError>(py)
+            || current.is_instance_of::<PyModuleNotFoundError>(py)
+            || is_kind("aisimulate_core.sdk.utils", "HuggingFaceDownloadError")
+            || is_kind("http.client", "HTTPException")
+            || (current.is_instance_of::<PyValueError>(py)
+                && (message.starts_with("config.json not found at ")
+                    || (message.starts_with("HuggingFace model ")
+                        && message.ends_with(" is not cached in model_configs directory."))));
+        if typed_invalid || !available {
+            return Err(invalid_config(format!(
+                "model metadata: {error}; cause: {current}"
+            )));
+        }
+        let next = if let Some(cause) = current.cause(py) {
+            Some(cause)
+        } else {
+            let suppressed = current
+                .value(py)
+                .getattr("__suppress_context__")
+                .and_then(|value| value.extract::<bool>())
+                .map_err(|error| {
+                    invalid_config(format!("model metadata exception chain: {error}"))
+                })?;
+            let context = current.value(py).getattr("__context__").map_err(|error| {
+                invalid_config(format!("model metadata exception chain: {error}"))
+            })?;
+            if suppressed || context.is_none() {
+                None
+            } else {
+                Some(PyErr::from_value(context))
+            }
+        };
+        let Some(next) = next else { return Ok(()) };
+        current = next;
+    }
+    Err(invalid_config(
+        "model metadata exception chain exceeds 32 links",
+    ))
 }
 
 fn invalid_config(message: impl Into<String>) -> AicError {

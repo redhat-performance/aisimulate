@@ -1032,6 +1032,7 @@ fn op_from_spec_json(py: Python<'_>, spec_json: &str) -> PyResult<Py<PyAny>> {
 /// config API.
 #[derive(Clone, Debug)]
 struct EngineBuildRequest {
+    execution_profile: Option<String>,
     model_path: String,
     system: String,
     backend: String,
@@ -1084,6 +1085,7 @@ impl AicEngineBuilder {
     ) -> Self {
         Self {
             request: EngineBuildRequest {
+                execution_profile: None,
                 model_path: model_path.into(),
                 system: system.into(),
                 backend: backend.as_str().to_owned(),
@@ -1484,6 +1486,7 @@ fn compile_engine_from_request(request: EngineBuildRequest) -> Result<Engine, Ai
         kwargs.set_item("forward_model", request.forward_model.as_deref())?;
         kwargs.set_item("fpm_parquet_path", request.fpm_parquet_path.as_deref())?;
         kwargs.set_item("decoder_replay", request.decoder_replay)?;
+        kwargs.set_item("execution_profile", request.execution_profile.as_deref())?;
         kwargs.set_item("database_mode", request.database_mode.as_deref())?;
         kwargs.set_item("shared_layer", request.shared_layer)?;
         kwargs.set_item("transfer_policy", request.transfer_policy.as_deref())?;
@@ -1543,6 +1546,18 @@ fn compile_engine_from_request(request: EngineBuildRequest) -> Result<Engine, Ai
     Engine::from_spec_bytes(&spec_bytes, systems_root.as_path() as &Path)
 }
 
+/// Family discovery only; Rust owns the profile's defaults and validation.
+/// Missing/unsupported metadata retains normal construction error handling.
+pub(crate) fn forward_pass_model_family(model: &str) -> Option<String> {
+    Python::with_gil(|py| -> PyResult<String> {
+        py.import("aisimulate_core.sdk.utils")?
+            .call_method1("get_model_config_from_model_path", (model,))?
+            .get_item("model_family")?
+            .extract()
+    })
+    .ok()
+}
+
 /// Compile the selected canonical native estimator through the shared builder.
 pub(crate) fn compile_forward_pass_model_to_engine(
     config: &crate::ForwardPassPerfModelConfig,
@@ -1554,6 +1569,9 @@ pub(crate) fn compile_forward_pass_model_to_engine(
         )
     })?;
     compile_engine_from_request(EngineBuildRequest {
+        execution_profile: config
+            .execution_profile
+            .map(|profile| profile.as_str().to_owned()),
         model_path: config.model.clone(),
         system: config.system.clone(),
         backend: config.backend.as_str().to_owned(),
@@ -1639,6 +1657,7 @@ fn engine_build_request(
         .and_then(|s| s.nextn)
         .unwrap_or(0);
     Ok(EngineBuildRequest {
+        execution_profile: config.extra.get("execution_profile").cloned(),
         model_path: config.model_name.clone(),
         system: config.system_name.clone(),
         backend: config.backend.as_str().to_owned(),
@@ -1793,10 +1812,33 @@ impl PyForwardPassPerfModel {
 
     /// Expand and validate the canonical schema without constructing an engine.
     #[staticmethod]
-    fn normalize_config(config_json: &str) -> PyResult<String> {
-        let config = parse_forward_pass_config(config_json)?;
-        config.validate().map_err(aic_to_py)?;
+    #[pyo3(signature = (config_json, model_family=None))]
+    fn normalize_config(config_json: &str, model_family: Option<&str>) -> PyResult<String> {
+        let mut config = parse_forward_pass_config(config_json)?;
+        if model_family.is_some() {
+            config
+                .resolve_execution_profile(model_family)
+                .map_err(aic_to_py)?;
+        } else {
+            config.resolve_identity().map_err(aic_to_py)?;
+        }
         serde_json::to_string(&config).map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Migration adapter for previously saved flat tuning options.
+    #[staticmethod]
+    #[pyo3(signature = (config_json, prefix_caching, host_retention=false, prefix_match=false))]
+    fn validate_replay_cache(
+        config_json: &str,
+        prefix_caching: bool,
+        host_retention: bool,
+        prefix_match: bool,
+    ) -> PyResult<()> {
+        let mut config = parse_forward_pass_config(config_json)?;
+        config.resolve_identity().map_err(aic_to_py)?;
+        config
+            .validate_replay_cache(prefix_caching, host_retention, prefix_match)
+            .map_err(aic_to_py)
     }
 
     /// Migration adapter for previously saved flat tuning options.
@@ -1845,7 +1887,13 @@ impl PyForwardPassPerfModel {
                 )));
             }
         };
-        let config = crate::ForwardPassPerfModelConfig {
+        let mut config = crate::ForwardPassPerfModelConfig {
+            model_family: None,
+            execution_profile: request
+                .execution_profile
+                .map(|profile| serde_json::from_value(serde_json::json!(profile)))
+                .transpose()
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
             model: request.model_path,
             system: request.system,
             backend: legacy.backend,
@@ -1884,6 +1932,7 @@ impl PyForwardPassPerfModel {
             enable_shared_layer: request.shared_layer,
             strict_provenance: legacy.strict_provenance,
         };
+        config.resolve_identity().map_err(aic_to_py)?;
         serde_json::to_string(&config).map_err(|e| PyValueError::new_err(e.to_string()))
     }
 

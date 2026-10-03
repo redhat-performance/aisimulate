@@ -60,8 +60,16 @@ def test_nested_captures_isolate_their_sinks():
 
 
 def test_worst_provenance_ranks_by_decreasing_confidence():
-    # Later tags in PROVENANCE_ORDER rely on more aggressive transfer.
-    assert list(PROVENANCE_ORDER) == ["silicon", "empirical", "xshape", "xquant", "xprofile", "xop"]
+    # Later tags have lower confidence; unvalidated analytics are weakest.
+    assert list(PROVENANCE_ORDER) == [
+        "silicon",
+        "empirical",
+        "xshape",
+        "xquant",
+        "xprofile",
+        "xop",
+        "analytic_unvalidated",
+    ]
 
     assert worst_provenance(set()) == "silicon"
     assert worst_provenance({"empirical"}) == "empirical"
@@ -69,6 +77,10 @@ def test_worst_provenance_ranks_by_decreasing_confidence():
     assert worst_provenance({"xshape", "xquant"}) == "xquant"
     assert worst_provenance({"xquant", "xprofile"}) == "xprofile"
     assert worst_provenance({"xprofile", "xop"}) == "xop"
+    assert worst_provenance({"analytic_unvalidated"}) == "analytic_unvalidated"
+    for tier in PROVENANCE_ORDER[:-1]:
+        assert worst_provenance({tier, "analytic_unvalidated"}) == "analytic_unvalidated"
+    assert worst_provenance(set(PROVENANCE_ORDER)) == "analytic_unvalidated"
     # Unknown tags rank as least-aggressive rather than raising.
     assert worst_provenance({"mystery", "xquant"}) == "xquant"
 

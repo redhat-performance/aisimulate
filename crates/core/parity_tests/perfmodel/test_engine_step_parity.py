@@ -1766,6 +1766,21 @@ class TestRustEngineStepHybridDisaggParity:
 # Llama-3.1-70B), one MoE (Qwen3-235B-A22B), one MLA (DeepSeek-V3 — also
 # covers MLA BMM + the mode-aware mem_op extras).
 SOL_CASES = [
+    # GLM5NEXT native KDA + compressed sparse MLA + mHC + FP32 projections.
+    # Analytical regression only, not an independently measured accuracy claim.
+    pytest.param(
+        EngineStepParityCase(
+            model_path="zai-org/GLM-5.3-Flash",
+            system_name="h200_sxm",
+            backend_version="0.24.0",
+            tp_size=4,
+            moe_tp_size=4,
+            moe_ep_size=1,
+            isl=4096,
+            database_mode="SOL",
+        ),
+        id="glm53-flash-h200-vllm-tp4-sol",
+    ),
     pytest.param(
         EngineStepParityCase(
             model_path="Qwen/Qwen3-32B",
@@ -1924,7 +1939,7 @@ class TestGoldenComparisonGuards:
         monkeypatch.setattr(
             sys.modules[__name__],
             "load_parity_golden",
-            lambda filename: doctored if filename == "engine_step.json" else original(filename),
+            lambda filename: (doctored if filename == "engine_step.json" else original(filename)),
         )
         reason = _parity_mismatch_reason(_static_comparison_metrics(case))
         assert reason is not None, "5% golden drift on static_ctx was not detected"
@@ -1948,7 +1963,7 @@ class TestGoldenComparisonGuards:
         monkeypatch.setattr(
             sys.modules[__name__],
             "load_parity_golden",
-            lambda filename: doctored if filename == "engine_step.json" else original(filename),
+            lambda filename: (doctored if filename == "engine_step.json" else original(filename)),
         )
         reason = _parity_mismatch_reason(_static_comparison_metrics(case))
         assert reason is not None, "golden-error vs rust-value asymmetry was not detected"
@@ -2365,7 +2380,10 @@ class TestRustEngineStepFpmHybridParity:
 class TestRustEngineStepFpmParity:
     @pytest.mark.parametrize("database_mode", ["SILICON", "HYBRID"])
     def test_auto_skips_absent_op_tables(self, fpm_systems_root, database_mode):
-        from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+        from aisimulate_core.sdk import (
+            ForwardPassPerfModelConfig,
+            RustForwardPassPerfModel,
+        )
 
         cfg = ForwardPassPerfModelConfig(
             model=_FPM_MODEL,
@@ -2393,7 +2411,10 @@ class TestRustEngineStepFpmParity:
             assert model.estimate_forward_pass_time_ms(
                 {
                     "version": 1,
-                    "scheduled_requests": {"num_decode_requests": 4, "sum_decode_kv_tokens": 4100},
+                    "scheduled_requests": {
+                        "num_decode_requests": 4,
+                        "sum_decode_kv_tokens": 4100,
+                    },
                 }
             ) == pytest.approx(4.5)
         finally:
@@ -2406,7 +2427,10 @@ class TestRustEngineStepFpmParity:
             RustForwardPassPerfModel.best_available(replace(cfg, estimation_mode="op_level"))
 
     def test_sol_does_not_require_op_tables(self, fpm_systems_root):
-        from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+        from aisimulate_core.sdk import (
+            ForwardPassPerfModelConfig,
+            RustForwardPassPerfModel,
+        )
 
         model = RustForwardPassPerfModel.best_available(
             ForwardPassPerfModelConfig(
@@ -2426,7 +2450,10 @@ class TestRustEngineStepFpmParity:
                 model.estimate_forward_pass_time_ms(
                     {
                         "version": 1,
-                        "scheduled_requests": {"num_decode_requests": 4, "sum_decode_kv_tokens": 4100},
+                        "scheduled_requests": {
+                            "num_decode_requests": 4,
+                            "sum_decode_kv_tokens": 4100,
+                        },
                     }
                 )
                 > 0

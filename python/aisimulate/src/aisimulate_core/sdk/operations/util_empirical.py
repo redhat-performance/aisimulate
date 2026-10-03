@@ -47,6 +47,7 @@ PROVENANCE_ORDER: tuple[str, ...] = (
     "xquant",  # cross-quant, same profile
     "xprofile",  # cross-quant, cross profile
     "xop",  # cross-op (borrowed a different op's util)
+    "analytic_unvalidated",  # tableless inventory, not measured/borrowed utilization
 )
 _PROVENANCE_RANK = {tag: i for i, tag in enumerate(PROVENANCE_ORDER)}
 _PROVENANCE: contextvars.ContextVar = contextvars.ContextVar("aic_provenance", default=None)

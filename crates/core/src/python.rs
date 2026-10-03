@@ -160,6 +160,10 @@ fn validate_public_agentic_engine(input: &ReplayRuntimeInput, rank: &EngineConfi
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AicTimingConfig {
+    #[serde(default)]
+    execution_profile: Option<String>,
+    #[serde(default)]
+    model_family: Option<String>,
     model: String,
     backend: String,
     system: String,
@@ -294,6 +298,16 @@ impl AicTimingConfig {
             *configured = Some(path.into());
         }
         Ok(ForwardPassPerfModelConfig {
+            model_family: self
+                .model_family
+                .as_ref()
+                .map(|family| serde_json::from_value(serde_json::json!(family)))
+                .transpose()?,
+            execution_profile: self
+                .execution_profile
+                .as_ref()
+                .map(|profile| serde_json::from_value(serde_json::json!(profile)))
+                .transpose()?,
             model: self.model.clone(),
             system: self.system.clone(),
             backend: serde_json::from_value(serde_json::Value::String(self.backend.clone()))?,
@@ -465,6 +479,14 @@ impl AicTimingModel {
         config.fpm_parquet_path = None;
         config.fallback_policy = ForwardPassFallbackPolicy::Deny;
         config.estimator_config = provenance.config.estimator_config.clone();
+        config.execution_profile = provenance
+            .config
+            .execution_profile
+            .map(|profile| profile.as_str().to_owned());
+        config.model_family = provenance
+            .config
+            .model_family
+            .map(|family| family.as_str().to_owned());
         let use_fpm_decode_totals =
             provenance.selected_estimation_mode == EstimationMode::FpmInterpolation;
         let native = model.native_engine().context(
@@ -938,6 +960,21 @@ fn resolve_role_timing(
     );
     let mut config: AicTimingConfig =
         serde_json::from_value(config).context("invalid AIC timing provider configuration")?;
+    let mut identity = config.estimator_request(worker_type)?;
+    identity.resolve_identity()?;
+    identity.validate_replay_cache(
+        role.rank.enable_prefix_caching,
+        role.rank.native_host_offload.is_some() || role.rank.g3_offload.is_some(),
+        role.rank.prefix_match_unit.is_some(),
+    )?;
+    config.execution_profile = identity
+        .execution_profile
+        .map(|profile| profile.as_str().to_owned());
+    config.model_family = identity
+        .model_family
+        .map(|family| family.as_str().to_owned());
+    config.moe_tp_size = identity.moe_tp_size;
+    config.moe_ep_size = identity.moe_ep_size;
     let mut timing = AicTimingModel::build(&mut config, worker_type)?;
     if !capture_performance_diagnostics {
         timing.diagnostic_model = None;
