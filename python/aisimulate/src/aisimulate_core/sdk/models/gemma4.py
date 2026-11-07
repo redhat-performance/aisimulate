@@ -107,9 +107,10 @@ class Gemma4MixModel(BaseModel):
             )
             assert num_experts >= self.config.moe_ep_size, f"ep size cannot be larger than num_experts {num_experts}"
         else:
-            # Dense Gemma 4: collapse the MoE search-space to ep=1 so pareto
-            # iteration doesn't enumerate equivalent dense configurations.
-            assert self.config.moe_ep_size == 1, (
+            # Dense Gemma 4: no routed-MoE block, so expert parallelism must be
+            # unset or 1. Default CLI/SDK callers leave the MoE dims unset;
+            # explicit moe_ep>1 would only enumerate equivalent dense shapes.
+            assert self.config.moe_ep_size in (None, 1), (
                 f"dense Gemma 4 variants require moe_ep_size=1, got {self.config.moe_ep_size}"
             )
         self._topk = topk

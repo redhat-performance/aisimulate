@@ -166,3 +166,23 @@ def test_role_context_limits_work_without_shared_model_context(monkeypatch):
 
     assert result == [parallel]
     assert seen == {64_000: True, 128_000: True}
+
+
+def test_dense_gemma4_recommendation_excludes_expert_parallel_shapes():
+    """Regression: dense Gemma 4 must not offer moe_ep>1 candidates.
+
+    Before the classification fix the whole family was treated as MoE, so KV
+    feasibility raised "dense Gemma 4 variants require moe_ep_size=1" for every
+    multi-GPU budget instead of yielding pure-TP candidates.
+    """
+    configs = model_hw.parallel_configs_for(
+        "nvidia/Gemma-4-31B-IT-NVFP4",
+        "gb300",
+        gpu_budget=8,
+        deployment_mode="agg",
+        backend="vllm",
+        max_seq_len=2048 + 128,
+    )
+
+    assert configs
+    assert {(config.shape.moe_tp, config.shape.moe_ep) for config in configs} == {(1, 1)}

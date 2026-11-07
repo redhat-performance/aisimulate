@@ -19,6 +19,7 @@ from functools import cache
 from typing import TYPE_CHECKING, Optional
 
 from aisimulate_core.sdk import common, config
+from aisimulate_core.sdk.errors import InvalidEngineConfigurationError
 from aisimulate_core.sdk.utils import (
     _get_language_quantization_config,
     _normalize_quant_algo,
@@ -42,7 +43,6 @@ _MOE_MODEL_FAMILIES = {
     "KIMIK3",
     "HYBRIDMOE",
     "QWEN3VL_MOE",
-    "GEMMA4MIX",
     "MINIMAXM3",
     "STEP3P7",
 }
@@ -1472,12 +1472,29 @@ def check_is_moe(model_path: str, model_info: dict | None = None) -> bool:
 
     For NEMOTRONH models, checks if 'E' (MoE layer) is in hybrid_override_pattern..
     E.g., Nemotron_H is not an MoE model, but Nemotron_3 is an MoE model.
+
+    For GEMMA4MIX, checks the parsed expert configuration: the family mixes
+    routed-MoE checkpoints (e.g. gemma-4-26B-A4B) with dense ones (e.g.
+    gemma-4-31B / E2B / E4B, topk=0 and num_experts=None).
     """
     if model_info is None:
         model_info = _get_model_info(model_path)
     family = _architecture_to_model_family(model_info["architecture"])
     if family in _MOE_MODEL_FAMILIES:
         return True
+    if family == "GEMMA4MIX":
+        # The family name alone must not enable MoE search, or the sweeper
+        # proposes moe_ep>1 shapes that the dense model rejects. A checkpoint
+        # that declares only one of the two expert fields is corrupt: failing
+        # loudly beats silently building a dense graph with no routed-expert
+        # work.
+        num_experts = model_info.get("num_experts")
+        topk = model_info.get("topk")
+        if bool(num_experts) != bool(topk):
+            raise InvalidEngineConfigurationError(
+                f"Gemma 4 checkpoint has inconsistent expert metadata: num_experts={num_experts!r}, topk={topk!r}"
+            )
+        return bool(num_experts)
     if family == "QWEN35":
         extra_params = model_info.get("extra_params")
         return isinstance(extra_params, common.Qwen35Config) and extra_params.num_experts > 0
