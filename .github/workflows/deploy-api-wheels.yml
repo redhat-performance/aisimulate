@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Red Hat deployment infrastructure (fork-only): build and publish the single
-# manylinux_2_28_x86_64 `aisimulate` wheel consumed by the ConfigIQ API service.
+# manylinux_2_28_x86_64 `aisim` wheel consumed by the ConfigIQ API service.
 # Reuses the repository's own `build-platform-wheel` composite action so the
 # deploy wheel is produced exactly like the validated platform wheels.
 name: Build and release API wheels
@@ -63,8 +63,15 @@ jobs:
       - name: Determine version and tag
         id: version
         run: |
-          whl=$(ls wheelhouse/aisimulate-*.whl | head -1)
-          version=$(basename "$whl" | sed -E 's/aisimulate-([^-]+)-.*/\1/')
+          # The published distribution is `aisim`; the import packages keep the
+          # historical `aisimulate` names. Fail rather than tag a release with
+          # an empty version if the wheel name changes again.
+          whl=$(ls wheelhouse/aisim-*.whl | head -1)
+          version=$(basename "$whl" | sed -E 's/aisim-([^-]+)-.*/\1/')
+          if [ -z "${version}" ]; then
+            echo "::error::Could not derive a version from ${whl}"
+            exit 1
+          fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "tag=deploy-api-v${version}+${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
       - name: Create versioned GitHub Release
@@ -77,14 +84,14 @@ jobs:
           gh release create "$tag" \
             --repo "$GITHUB_REPOSITORY" \
             --title "API wheels v${{ steps.version.outputs.version }} (${GITHUB_SHA:0:8})" \
-            --notes "Auto-built manylinux_2_28_x86_64 aisimulate wheel from the deploy/api branch.
+            --notes "Auto-built manylinux_2_28_x86_64 aisim wheel from the deploy/api branch.
 
           Commit: ${GITHUB_SHA}
           Branch: deploy/api
 
           Install:
           \`\`\`
-          pip install aisimulate --find-links https://github.com/${GITHUB_REPOSITORY}/releases/expanded_assets/deploy-api-latest
+          pip install aisim --find-links https://github.com/${GITHUB_REPOSITORY}/releases/expanded_assets/deploy-api-latest
           \`\`\`" \
             --prerelease \
             wheelhouse/*.whl
@@ -97,7 +104,7 @@ jobs:
           gh release create deploy-api-latest \
             --repo "$GITHUB_REPOSITORY" \
             --title "API wheels (latest)" \
-            --notes "Latest manylinux_2_28_x86_64 aisimulate wheel from the deploy/api branch.
+            --notes "Latest manylinux_2_28_x86_64 aisim wheel from the deploy/api branch.
 
           Built from: ${{ steps.version.outputs.tag }}
           Commit: ${GITHUB_SHA}" \
