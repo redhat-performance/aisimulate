@@ -1,0 +1,105 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Red Hat deployment infrastructure (fork-only): build and publish the single
+# manylinux_2_28_x86_64 `aisimulate` wheel consumed by the ConfigIQ API service.
+# Reuses the repository's own `build-platform-wheel` composite action so the
+# deploy wheel is produced exactly like the validated platform wheels.
+name: Build and release API wheels
+
+on:
+  push:
+    branches:
+      - deploy/api
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-api-wheels-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build manylinux_2_28_x86_64 wheel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          lfs: true
+      - name: Build and verify wheel
+        uses: ./.github/actions/build-platform-wheel
+        with:
+          build_method: docker
+          python_architecture: x64
+          platform: linux/amd64
+          wheel_base: quay.io/pypa/manylinux_2_28_x86_64
+      - name: List built wheels
+        run: ls -lh wheelhouse/
+      - name: Upload wheel as artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: wheels-manylinux-x86_64
+          path: wheelhouse/*.whl
+          retention-days: 90
+
+  release:
+    name: Publish wheel to GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download wheel artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: wheels-manylinux-x86_64
+          path: wheelhouse/
+      - name: Determine version and tag
+        id: version
+        run: |
+          whl=$(ls wheelhouse/aisimulate-*.whl | head -1)
+          version=$(basename "$whl" | sed -E 's/aisimulate-([^-]+)-.*/\1/')
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=deploy-api-v${version}+${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
+      - name: Create versioned GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.version.outputs.tag }}"
+          gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
+          gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${tag}" -X DELETE 2>/dev/null || true
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "API wheels v${{ steps.version.outputs.version }} (${GITHUB_SHA:0:8})" \
+            --notes "Auto-built manylinux_2_28_x86_64 aisimulate wheel from the deploy/api branch.
+
+          Commit: ${GITHUB_SHA}
+          Branch: deploy/api
+
+          Install:
+          \`\`\`
+          pip install aisimulate --find-links https://github.com/${GITHUB_REPOSITORY}/releases/expanded_assets/deploy-api-latest
+          \`\`\`" \
+            --prerelease \
+            wheelhouse/*.whl
+      - name: Update latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete deploy-api-latest --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
+          gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/deploy-api-latest" -X DELETE 2>/dev/null || true
+          gh release create deploy-api-latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "API wheels (latest)" \
+            --notes "Latest manylinux_2_28_x86_64 aisimulate wheel from the deploy/api branch.
+
+          Built from: ${{ steps.version.outputs.tag }}
+          Commit: ${GITHUB_SHA}" \
+            --prerelease \
+            wheelhouse/*.whl
