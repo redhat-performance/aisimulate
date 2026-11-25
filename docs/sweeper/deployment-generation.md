@@ -329,7 +329,8 @@ image settings belong to generator overrides.
 | Target | Artifacts and scope |
 |---|---|
 | `dynamo-j2`, `dynamo-python` | Dynamo worker launch scripts, backend flags/configuration and deployment resources |
-| `llm-d-helm`, `llm-d-kustomize` | llm-d deployment configuration with explicitly selected runtime images |
+| `llm-d-helm` | llm-d ModelService Helm values with explicitly selected runtime images |
+| `llm-d-kustomize` | llm-d kustomize overlay: router and prerequisites are separate; the overlay patches one model-server base (see below) |
 | `fpm` | Reusable vLLM resource workload, `fpm_env.sh` and `run.sh` |
 | `slurm` | Single-node Dynamo service/benchmark bundle for Slurm with Pyxis/Enroot |
 
@@ -338,6 +339,41 @@ identity, scheduler limits and supported adapter state. It rejects unknown
 adapter mappings and GPU-count mismatches. Canonical result views remain
 unchanged by artifact rendering. Compatibility CLI generation flags are in
 [the AIC CLI reference](../aic-backward-compatibility/cli.md#deployment-target-selection).
+
+## llm-d kustomize layouts
+
+The `llm-d-kustomize` target emits a thin overlay: a `kustomization.yaml` that
+names a model-server base inside an llm-d checkout, plus the role patches. Set
+`LlmdConfig.kustomize_base_path` when the base is not the default for the
+selected layout. The path is resolved by Kustomize relative to the overlay, and
+Kustomize rejects absolute paths and paths outside its root, so the overlay has
+to be applied from inside the checkout.
+
+`LlmdConfig.kustomize_layout` selects which base shape the patches address:
+
+| Layout | Base shape | llm-d direction |
+|---|---|---|
+| `deployment` (default) | prefill and decode are two `Deployment` objects | guides before v1.0 |
+| `disaggregatedset` | both roles are entries in one `DisaggregatedSet` (`disaggregatedset.x-k8s.io/v1`) | v1.0 and later P/D guides |
+
+`deployment` also selects an XPU base when `LlmdConfig.accelerator_type` is
+XPU. `disaggregatedset` defaults `LlmdConfig.kustomize_base_path` to the GPU
+vLLM P/D guide base, so set it explicitly for a different accelerator.
+
+`disaggregatedset` applies to disaggregated mode only; aggregated mode has no
+P/D split and renders the `Deployment` overlay. The two layouts are not
+interchangeable: patching a `DisaggregatedSet` with a strategic-merge patch
+would replace `spec.roles` wholesale, because a CRD list has no merge key. The
+`disaggregatedset` patches are therefore JSON 6902 documents with an explicit
+`target`, and each starts with a `test` op on the role name so a reordered base
+fails the build instead of patching the wrong role.
+
+`LlmdConfig.kustomize_disaggregatedset_name` names the resource the patches
+address (default `pd-disagg-vllm`), and `LlmdConfig.kustomize_name_prefix`
+applies a prefix to the built resources. Neither layout pins an llm-d revision
+or an image: pass `LlmdConfig.vllm_image` with an immutable tag or digest, and
+record the llm-d revision you applied the overlay to. A layout/base mismatch
+fails at `kustomize build`, not at render time.
 
 ## FPM resource workload
 

@@ -1,0 +1,61 @@
+{#
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-#}
+{#
+JSON 6902 patch for the decode role of the llm-d v1.0+ `DisaggregatedSet`.
+See llm-d-disaggregatedset-kustomization.yaml.j2 for why this is JSON 6902 and
+why the first op is a `test`.
+#}
+{%- set service_config = ServiceConfig | default({}) -%}
+{%- set llmd_config = LlmdConfig | default({}) -%}
+{%- set node_config = NodeConfig | default({}) -%}
+{%- set model_name = service_config.model_path | default('meta-llama/Llama-3.1-8B') -%}
+{%- set served_name = service_config.served_model_name | default(model_name.split('/')[-1], true) -%}
+{%- set role_workers = decode_workers | default(1) -%}
+{%- set role_gpu = (decode_tensor_parallel_size | default(1) | int) * (decode_pipeline_parallel_size | default(1) | int) -%}
+{%- set role_cli_args = decode_cli_args_list | default([]) -%}
+{%- set default_accelerator_type = 'xpu' if node_config.system_name | default('') == 'b60' else 'nvidia' -%}
+{%- set accelerator_type = llmd_config.accelerator_type | default(default_accelerator_type, true) -%}
+{%- set is_xpu = accelerator_type in ['xpu', 'intel'] -%}
+{%- set xpu_rdma_enabled = llmd_config.xpu_rdma_enabled | default(false) -%}
+{%- set xpu_kv_buffer_device = llmd_config.xpu_kv_buffer_device | default('xpu' if xpu_rdma_enabled else 'cpu', true) -%}
+{%- if is_xpu -%}
+{%- set kv_transfer_config = '{"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_buffer_device":"' ~ xpu_kv_buffer_device ~ '"}' -%}
+{%- else -%}
+{%- set kv_transfer_config = '{"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_buffer_device":"cuda","kv_connector_extra_config":{"backends":["UCX"]}}' -%}
+{%- endif -%}
+- op: test
+  path: /spec/roles/1/name
+  value: decode
+- op: replace
+  path: /spec/roles/1/spec/replicas
+  value: {{ role_workers }}
+- op: replace
+  path: /spec/roles/1/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/image
+  value: {{ llmd_config.vllm_image | default('vllm/vllm-openai:latest') | tojson }}
+- op: replace
+  path: /spec/roles/1/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/args
+  value:
+    - {{ model_name | tojson }}
+    - --served-model-name
+    - {{ served_name | tojson }}
+    {% for arg in role_cli_args %}
+    - {{ arg | tojson }}
+    {% endfor %}
+    {% if '--kv-transfer-config' not in role_cli_args %}
+    - --kv-transfer-config
+    - {{ kv_transfer_config | tojson }}
+    {% endif %}
+    {% if '--port' not in role_cli_args and '--port=8200' not in role_cli_args %}
+    - --port=8200
+    {% endif %}
+{% if not is_xpu %}
+- op: replace
+  path: /spec/roles/1/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/resources
+  value:
+    limits:
+      nvidia.com/gpu: "{{ role_gpu }}"
+    requests:
+      nvidia.com/gpu: "{{ role_gpu }}"
+{% endif %}

@@ -350,6 +350,12 @@ inputs:
   - key: LlmdConfig.kustomize_base_path
     required: false
     default: ""
+  - key: LlmdConfig.kustomize_layout
+    required: false
+    default: "deployment"
+  - key: LlmdConfig.kustomize_disaggregatedset_name
+    required: false
+    default: "pd-disagg-vllm"
   - key: LlmdConfig.kustomize_name_prefix
     required: false
     default: ""

@@ -1,0 +1,39 @@
+{#
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-#}
+{#
+Kustomize overlay for the llm-d v1.0+ P/D layout, where both roles live in one
+`DisaggregatedSet` (disaggregatedset.x-k8s.io/v1) instead of two Deployments.
+
+The role patches are JSON 6902 documents: Kustomize has no strategic-merge key
+for a CRD list, so a strategic merge would replace `spec.roles` wholesale. Each
+patch states its target explicitly and begins with a `test` op on the role name,
+so a base whose role order changes fails the build instead of patching the wrong
+role.
+#}
+{%- set llmd_config = LlmdConfig | default({}) -%}
+{%- set resource_name = llmd_config.kustomize_disaggregatedset_name | default('pd-disagg-vllm', true) -%}
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - {{ llmd_config.kustomize_base_path | default('guides/pd-disaggregation/modelserver/gpu/vllm/base', true) }}
+
+{% if llmd_config.kustomize_name_prefix | default('', true) %}
+namePrefix: {{ llmd_config.kustomize_name_prefix }}
+
+{% endif %}
+patches:
+  - path: patch-decode.yaml
+    target:
+      group: disaggregatedset.x-k8s.io
+      version: v1
+      kind: DisaggregatedSet
+      name: {{ resource_name }}
+  - path: patch-prefill.yaml
+    target:
+      group: disaggregatedset.x-k8s.io
+      version: v1
+      kind: DisaggregatedSet
+      name: {{ resource_name }}

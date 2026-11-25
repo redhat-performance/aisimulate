@@ -499,3 +499,148 @@ def test_dynamo_python_deployment():
         assert "k8s_deploy.yaml" not in artifacts or artifacts["k8s_deploy.yaml"] == ""
         # Should still have other artifacts like run scripts
         assert any(k.startswith("run_") for k in artifacts)
+
+
+def _disaggregatedset_params(mode: str = "disagg") -> dict:
+    """Parameters shared by the DisaggregatedSet layout tests."""
+    return {
+        "ServiceConfig": {
+            "model_path": "Qwen/Qwen3-32B",
+            "served_model_name": "qwen3-32b",
+            "port": 8000,
+        },
+        "DynConfig": {"mode": mode},
+        "SlaConfig": {"isl": 4000, "osl": 1000},
+        "LlmdConfig": {
+            "vllm_image": "vllm/vllm-openai@sha256:abc123",
+            "kustomize_layout": "disaggregatedset",
+        },
+        "WorkerConfig": {
+            "prefill_workers": 3,
+            "decode_workers": 9,
+            "prefill_gpus_per_worker": 1,
+            "decode_gpus_per_worker": 2,
+        },
+        "params": {
+            "prefill": {"gpus_per_worker": 1},
+            "decode": {"gpus_per_worker": 2},
+        },
+        "prefill_tensor_parallel_size": 1,
+        "prefill_pipeline_parallel_size": 1,
+        "prefill_data_parallel_size": 1,
+        "decode_tensor_parallel_size": 2,
+        "decode_pipeline_parallel_size": 1,
+        "decode_data_parallel_size": 1,
+        "prefill_cli_args_list": ["--tensor-parallel-size", "1", "--max-num-batched-tokens", "5500"],
+        "decode_cli_args_list": ["--tensor-parallel-size", "2", "--max-num-seqs", "512"],
+    }
+
+
+@pytest.mark.unit
+def test_llmd_kustomize_disaggregatedset_layout():
+    """The v1.0+ layout patches one DisaggregatedSet instead of two Deployments."""
+    artifacts = render_backend_templates(
+        param_values=_disaggregatedset_params(),
+        backend="vllm",
+        deployment_target="llm-d-kustomize",
+    )
+
+    assert set(artifacts) >= {"kustomization.yaml", "patch-decode.yaml", "patch-prefill.yaml"}
+    assert "patch-vllm.yaml" not in artifacts
+    assert "llm-d-values.yaml" not in artifacts
+
+    kustomization = yaml.safe_load(artifacts["kustomization.yaml"])
+    assert kustomization["resources"] == ["guides/pd-disaggregation/modelserver/gpu/vllm/base"]
+    assert [patch["path"] for patch in kustomization["patches"]] == [
+        "patch-decode.yaml",
+        "patch-prefill.yaml",
+    ]
+    target = kustomization["patches"][0]["target"]
+    assert target == {
+        "group": "disaggregatedset.x-k8s.io",
+        "version": "v1",
+        "kind": "DisaggregatedSet",
+        "name": "pd-disagg-vllm",
+    }
+
+    decode = yaml.safe_load(artifacts["patch-decode.yaml"])
+    assert isinstance(decode, list)
+    # The guard op makes a reordered base fail the build instead of patching
+    # the wrong role.
+    assert decode[0] == {"op": "test", "path": "/spec/roles/1/name", "value": "decode"}
+    decode_ops = {op["path"]: op["value"] for op in decode if op["op"] == "replace"}
+    decode_container = "/spec/roles/1/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0"
+    assert decode_ops["/spec/roles/1/spec/replicas"] == 9
+    assert decode_ops[f"{decode_container}/image"] == "vllm/vllm-openai@sha256:abc123"
+    decode_args = decode_ops[f"{decode_container}/args"]
+    assert "--port=8200" in decode_args
+    assert any('"kv_role":"kv_consumer"' in arg for arg in decode_args)
+    assert decode_ops[f"{decode_container}/resources"] == {
+        "limits": {"nvidia.com/gpu": "2"},
+        "requests": {"nvidia.com/gpu": "2"},
+    }
+
+    prefill = yaml.safe_load(artifacts["patch-prefill.yaml"])
+    assert prefill[0] == {"op": "test", "path": "/spec/roles/0/name", "value": "prefill"}
+    prefill_ops = {op["path"]: op["value"] for op in prefill if op["op"] == "replace"}
+    prefill_container = "/spec/roles/0/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0"
+    assert prefill_ops["/spec/roles/0/spec/replicas"] == 3
+    prefill_args = prefill_ops[f"{prefill_container}/args"]
+    assert any('"kv_role":"kv_producer"' in arg for arg in prefill_args)
+    # every token budget renders 64-aligned (owner decision 2026-09-24)
+    assert "5504" in prefill_args
+    assert prefill_ops[f"{prefill_container}/resources"] == {
+        "limits": {"nvidia.com/gpu": "1"},
+        "requests": {"nvidia.com/gpu": "1"},
+    }
+
+
+@pytest.mark.unit
+def test_llmd_kustomize_disaggregatedset_layout_is_disagg_only():
+    """Aggregated mode has no P/D roles, so it keeps the Deployment overlay."""
+    params = {
+        "ServiceConfig": {
+            "model_path": "Qwen/Qwen3-8B",
+            "served_model_name": "qwen3-8b",
+            "port": 8000,
+        },
+        "DynConfig": {"mode": "agg"},
+        "LlmdConfig": {
+            "vllm_image": "vllm/vllm-openai:v0.24.0",
+            "kustomize_layout": "disaggregatedset",
+        },
+        "WorkerConfig": {"agg_workers": 2, "agg_gpus_per_worker": 4},
+        "params": {"agg": {"gpus_per_worker": 4}},
+        "agg_tensor_parallel_size": 4,
+        "agg_pipeline_parallel_size": 1,
+        "agg_data_parallel_size": 1,
+        "agg_cli_args_list": ["--tensor-parallel-size", "4"],
+    }
+
+    artifacts = render_backend_templates(
+        param_values=params,
+        backend="vllm",
+        deployment_target="llm-d-kustomize",
+    )
+
+    assert set(artifacts) >= {"kustomization.yaml", "patch-vllm.yaml"}
+    assert "patch-decode.yaml" not in artifacts
+    assert "patch-prefill.yaml" not in artifacts
+    kustomization = yaml.safe_load(artifacts["kustomization.yaml"])
+    assert kustomization["patches"] == [{"path": "patch-vllm.yaml"}]
+    patch = yaml.safe_load(artifacts["patch-vllm.yaml"])
+    assert patch["kind"] == "Deployment"
+
+
+@pytest.mark.unit
+def test_llmd_kustomize_rejects_unknown_layout():
+    """An unknown layout must fail closed rather than render the wrong shape."""
+    params = _disaggregatedset_params()
+    params["LlmdConfig"]["kustomize_layout"] = "statefulset"
+
+    with pytest.raises(ValueError, match="kustomize_layout"):
+        render_backend_templates(
+            param_values=params,
+            backend="vllm",
+            deployment_target="llm-d-kustomize",
+        )
