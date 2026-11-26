@@ -708,17 +708,34 @@ def test_llmd_kustomize_disaggregatedset_prefix_keeps_the_service_account_bindin
     }
 
 
+def _claim_patches(kustomization: dict) -> dict[str, list[dict]]:
+    """Inline ResourceClaimTemplate patches, keyed by target name."""
+    return {
+        patch["target"]["name"]: yaml.safe_load(patch["patch"])
+        for patch in kustomization["patches"]
+        if patch.get("target", {}).get("kind") == "ResourceClaimTemplate"
+    }
+
+
 @pytest.mark.unit
 def test_llmd_kustomize_disaggregatedset_xpu_follows_the_xpu_guide():
-    """XPU selects its own base, resource name, and KV buffer device."""
-    artifacts = _render_disaggregatedset(
-        accelerator_type="xpu",
-        xpu_kv_buffer_device="cpu",
+    """XPU selects its own base, resource name, claim counts, and KV buffer."""
+    params = _disaggregatedset_params()
+    params["LlmdConfig"].update({"accelerator_type": "xpu", "xpu_kv_buffer_device": "cpu"})
+    # TP=1/DP=2 prefill and TP=2/DP=2 decode give the two roles distinct counts.
+    params["params"]["prefill"].update({"tensor_parallel_size": 1, "data_parallel_size": 2})
+    params["params"]["decode"].update({"tensor_parallel_size": 2, "data_parallel_size": 2})
+    params["prefill_data_parallel_size"] = 2
+    params["decode_data_parallel_size"] = 2
+    artifacts = render_backend_templates(
+        param_values=params,
+        backend="vllm",
+        deployment_target="llm-d-kustomize",
     )
 
     kustomization = yaml.safe_load(artifacts["kustomization.yaml"])
     assert kustomization["resources"] == ["guides/pd-disaggregation/modelserver/xpu/vllm"]
-    assert [patch["target"]["name"] for patch in kustomization["patches"]] == [
+    assert [patch["target"]["name"] for patch in kustomization["patches"][:2]] == [
         "pd-disagg-xpu",
         "pd-disagg-xpu",
     ]
@@ -730,8 +747,46 @@ def test_llmd_kustomize_disaggregatedset_xpu_follows_the_xpu_guide():
         args = next(op["value"] for op in ops if op["path"].endswith("/args"))
         assert any('"kv_buffer_device":"cpu"' in arg for arg in args)
 
-    rdma = yaml.safe_load(_render_disaggregatedset(accelerator_type="xpu", xpu_rdma_enabled=True)["kustomization.yaml"])
+    claims = _claim_patches(kustomization)
+    assert claims == {
+        "xpu-decode-claim-xpu": [
+            {"op": "test", "path": "/spec/spec/devices/requests/0/name", "value": "intel"},
+            {
+                "op": "replace",
+                "path": "/spec/spec/devices/requests/0/exactly/count",
+                "value": 4,
+            },
+        ],
+        "xpu-prefill-claim-xpu": [
+            {"op": "test", "path": "/spec/spec/devices/requests/0/name", "value": "intel"},
+            {
+                "op": "replace",
+                "path": "/spec/spec/devices/requests/0/exactly/count",
+                "value": 2,
+            },
+        ],
+    }
+
+    rdma_params = _disaggregatedset_params()
+    rdma_params["LlmdConfig"].update({"accelerator_type": "xpu", "xpu_rdma_enabled": True})
+    rdma_params["params"]["decode"].update({"tensor_parallel_size": 2, "data_parallel_size": 2})
+    rdma_params["params"]["prefill"].update({"tensor_parallel_size": 1, "data_parallel_size": 2})
+    rdma_params["decode_data_parallel_size"] = 2
+    rdma_params["prefill_data_parallel_size"] = 2
+    rdma = yaml.safe_load(
+        render_backend_templates(
+            param_values=rdma_params,
+            backend="vllm",
+            deployment_target="llm-d-kustomize",
+        )["kustomization.yaml"]
+    )
     assert rdma["resources"] == ["guides/pd-disaggregation/modelserver/xpu/vllm/rdma"]
+    rdma_claims = _claim_patches(rdma)
+    # The RDMA override renames the accelerator request; the `nic` request that
+    # follows it must not be touched.
+    assert [ops[0]["value"] for ops in rdma_claims.values()] == ["gpu", "gpu"]
+    assert all(ops[1]["path"].endswith("requests/0/exactly/count") for ops in rdma_claims.values())
+    assert [ops[1]["value"] for ops in rdma_claims.values()] == [4, 2]
 
 
 @pytest.mark.unit

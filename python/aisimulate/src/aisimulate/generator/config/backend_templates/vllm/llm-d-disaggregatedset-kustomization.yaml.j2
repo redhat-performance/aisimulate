@@ -34,6 +34,11 @@ roles bound to the built account.
     default follows the base and an explicit name always wins. -#}
 {%- set default_resource_name = 'pd-disagg-xpu' if is_xpu else 'pd-disagg-vllm' -%}
 {%- set resource_name = llmd_config.kustomize_disaggregatedset_name | default(default_resource_name, true) -%}
+{%- set prefill_gpu = (prefill_tensor_parallel_size | default(1) | int) * (prefill_pipeline_parallel_size | default(1) | int) * (prefill_data_parallel_size | default(1) | int) -%}
+{%- set decode_gpu = (decode_tensor_parallel_size | default(1) | int) * (decode_pipeline_parallel_size | default(1) | int) * (decode_data_parallel_size | default(1) | int) -%}
+{#- The XPU guides name the accelerator request `intel`, while the RDMA
+    override renames it `gpu` and adds a separate `nic` request after it. -#}
+{%- set xpu_request_name = 'gpu' if xpu_rdma_enabled else 'intel' -%}
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -60,3 +65,32 @@ patches:
       version: v1
       kind: DisaggregatedSet
       name: {{ resource_name }}
+{% if is_xpu %}
+  # XPU requests devices through ResourceClaimTemplates, so the GPU ops in the
+  # role patches do not apply. Each role's claim must ask for one device per
+  # TP x PP x DP rank; the RDMA guide's `nic` request is left alone.
+  - target:
+      group: resource.k8s.io
+      version: v1
+      kind: ResourceClaimTemplate
+      name: xpu-decode-claim-xpu
+    patch: |-
+      - op: test
+        path: /spec/spec/devices/requests/0/name
+        value: {{ xpu_request_name }}
+      - op: replace
+        path: /spec/spec/devices/requests/0/exactly/count
+        value: {{ decode_gpu }}
+  - target:
+      group: resource.k8s.io
+      version: v1
+      kind: ResourceClaimTemplate
+      name: xpu-prefill-claim-xpu
+    patch: |-
+      - op: test
+        path: /spec/spec/devices/requests/0/name
+        value: {{ xpu_request_name }}
+      - op: replace
+        path: /spec/spec/devices/requests/0/exactly/count
+        value: {{ prefill_gpu }}
+{% endif %}
