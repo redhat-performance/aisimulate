@@ -33,9 +33,16 @@ roles bound to the built account.
 {#- Each accelerator's guide names its DisaggregatedSet differently, so the
     default follows the base and an explicit name always wins. -#}
 {%- set default_resource_name = 'pd-disagg-xpu' if is_xpu else 'pd-disagg-vllm' -%}
-{%- set resource_name = llmd_config.kustomize_disaggregatedset_name | default(default_resource_name, true) -%}
-{%- set prefill_gpu = (prefill_tensor_parallel_size | default(1) | int) * (prefill_pipeline_parallel_size | default(1) | int) * (prefill_data_parallel_size | default(1) | int) -%}
-{%- set decode_gpu = (decode_tensor_parallel_size | default(1) | int) * (decode_pipeline_parallel_size | default(1) | int) * (decode_data_parallel_size | default(1) | int) -%}
+{%- set explicit_resource_name = llmd_config.kustomize_disaggregatedset_name | default('', true) -%}
+{%- set resource_name = explicit_resource_name | default(default_resource_name, true) -%}
+{#- The claim count is the rule-derived per-worker GPU count, so it matches the
+    topology the role args encode. The products are only a fallback for callers
+    that render the template outside `render_backend_templates`; prefill CP
+    expands the world, decode CP does not. -#}
+{%- set prefill_claim_fallback = (prefill_tensor_parallel_size | default(1) | int) * (prefill_pipeline_parallel_size | default(1) | int) * (prefill_data_parallel_size | default(1) | int) * (prefill_context_parallel_size | default(1) | int) -%}
+{%- set decode_claim_fallback = (decode_tensor_parallel_size | default(1) | int) * (decode_pipeline_parallel_size | default(1) | int) * (decode_data_parallel_size | default(1) | int) -%}
+{%- set prefill_claim_count = prefill_gpu | default(prefill_claim_fallback, true) -%}
+{%- set decode_claim_count = decode_gpu | default(decode_claim_fallback, true) -%}
 {#- The XPU guides name the accelerator request `intel`, while the RDMA
     override renames it `gpu` and adds a separate `nic` request after it. -#}
 {%- set xpu_request_name = 'gpu' if xpu_rdma_enabled else 'intel' -%}
@@ -53,6 +60,20 @@ namePrefix: {{ llmd_config.kustomize_name_prefix }}
 
 {% endif %}
 patches:
+{% if explicit_resource_name %}
+  # kustomize skips a patch whose target matches nothing, without an error.
+  # With an explicit name, a mismatch would leave the base DisaggregatedSet
+  # unpatched and ship its model instead of the requested one. Matching by kind
+  # and testing `metadata.name` turns that silent skip into a build failure.
+  - target:
+      group: disaggregatedset.x-k8s.io
+      version: v1
+      kind: DisaggregatedSet
+    patch: |-
+      - op: test
+        path: /metadata/name
+        value: {{ resource_name }}
+{% endif %}
   - path: patch-decode.yaml
     target:
       group: disaggregatedset.x-k8s.io
@@ -67,8 +88,8 @@ patches:
       name: {{ resource_name }}
 {% if is_xpu %}
   # XPU requests devices through ResourceClaimTemplates, so the GPU ops in the
-  # role patches do not apply. Each role's claim must ask for one device per
-  # TP x PP x DP rank; the RDMA guide's `nic` request is left alone.
+  # role patches do not apply. Each role's claim asks for the rule-derived GPU
+  # count; the RDMA guide's `nic` request is left alone.
   - target:
       group: resource.k8s.io
       version: v1
@@ -80,7 +101,7 @@ patches:
         value: {{ xpu_request_name }}
       - op: replace
         path: /spec/spec/devices/requests/0/exactly/count
-        value: {{ decode_gpu }}
+        value: {{ decode_claim_count }}
   - target:
       group: resource.k8s.io
       version: v1
@@ -92,5 +113,5 @@ patches:
         value: {{ xpu_request_name }}
       - op: replace
         path: /spec/spec/devices/requests/0/exactly/count
-        value: {{ prefill_gpu }}
+        value: {{ prefill_claim_count }}
 {% endif %}

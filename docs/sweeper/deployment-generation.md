@@ -379,11 +379,12 @@ ServiceAccount while both role pod templates kept the unprefixed name.
 `LlmdConfig.kustomize_disaggregatedset_name` names the resource the patches
 address. It defaults to the guide's own name for the selected accelerator
 (`pd-disagg-vllm`, or `pd-disagg-xpu` for XPU); an explicit value always wins.
-Each role requests `tensor_parallel_size * pipeline_parallel_size *
-data_parallel_size` GPUs, and the GPU entries are patched in place so the
-base's CPU and memory requests and limits are preserved. On XPU the accelerator
+Each role requests the worker GPU count the vLLM rule resolves (TP × PP × DP,
+times prefill CP because `-pcp` expands the world size; decode CP adds none),
+and the GPU entries are patched in place so the base's CPU and memory requests
+and limits are preserved. On XPU the accelerator
 comes from a `ResourceClaimTemplate` instead, so each role's claim requests the
-same count (one device per TP × PP × DP rank); the RDMA guide's separate `nic`
+same count; the RDMA guide's separate `nic`
 request is left unchanged. Neither layout pins an llm-d revision or an image:
 pass `LlmdConfig.vllm_image` with an immutable tag or digest, and record the
 llm-d revision you applied the overlay to.
@@ -391,8 +392,11 @@ llm-d revision you applied the overlay to.
 A patch whose `target` matches no resource is skipped silently by
 `kustomize build`; it does not fail. When the base renames its
 `DisaggregatedSet` or changes the role order, the `test` op fails loudly, but a
-name that matches nothing leaves the base unpatched. Check the built output, or
-set `kustomize_disaggregatedset_name` to the name the base actually declares.
+name that matches nothing leaves the base unpatched. An explicit
+`kustomize_disaggregatedset_name` therefore also emits a guard patch that
+matches the base `DisaggregatedSet` by kind and tests `/metadata/name`, so a
+name the base does not declare fails the build instead of shipping the base
+model. The resolved default names match their guides and need no guard.
 
 ## FPM resource workload
 

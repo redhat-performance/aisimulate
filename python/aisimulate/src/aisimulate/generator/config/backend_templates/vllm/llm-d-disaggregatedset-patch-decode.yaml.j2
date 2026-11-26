@@ -13,7 +13,12 @@ why the first op is a `test`.
 {%- set model_name = service_config.model_path | default('meta-llama/Llama-3.1-8B') -%}
 {%- set served_name = service_config.served_model_name | default(model_name.split('/')[-1], true) -%}
 {%- set role_workers = decode_workers | default(1) -%}
-{%- set role_gpu = (decode_tensor_parallel_size | default(1) | int) * (decode_pipeline_parallel_size | default(1) | int) * (decode_data_parallel_size | default(1) | int) -%}
+{#- Prefer the rule-derived count: it is the one topology the args encode, and
+    it keeps the pod request in step with any knob a parallel-size product
+    misses (for example decode CP, which reuses attention ranks and adds no
+    GPUs, so the fallback product stays TP x PP x DP). -#}
+{%- set role_gpu_fallback = (decode_tensor_parallel_size | default(1) | int) * (decode_pipeline_parallel_size | default(1) | int) * (decode_data_parallel_size | default(1) | int) -%}
+{%- set role_gpu = decode_gpu | default(role_gpu_fallback, true) -%}
 {%- set role_cli_args = decode_cli_args_list | default([]) -%}
 {%- set default_accelerator_type = 'xpu' if node_config.system_name | default('') == 'b60' else 'nvidia' -%}
 {%- set accelerator_type = llmd_config.accelerator_type | default(default_accelerator_type, true) -%}

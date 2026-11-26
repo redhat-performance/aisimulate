@@ -13,7 +13,11 @@ why the first op is a `test`.
 {%- set model_name = service_config.model_path | default('meta-llama/Llama-3.1-8B') -%}
 {%- set served_name = service_config.served_model_name | default(model_name.split('/')[-1], true) -%}
 {%- set role_workers = prefill_workers | default(1) -%}
-{%- set role_gpu = (prefill_tensor_parallel_size | default(1) | int) * (prefill_pipeline_parallel_size | default(1) | int) * (prefill_data_parallel_size | default(1) | int) -%}
+{#- Prefer the rule-derived count: it is the one topology the args encode, and
+    the fallback product includes prefill CP, which expands the world size
+    (world = TP x PP x DP x CP). -#}
+{%- set role_gpu_fallback = (prefill_tensor_parallel_size | default(1) | int) * (prefill_pipeline_parallel_size | default(1) | int) * (prefill_data_parallel_size | default(1) | int) * (prefill_context_parallel_size | default(1) | int) -%}
+{%- set role_gpu = prefill_gpu | default(role_gpu_fallback, true) -%}
 {%- set role_cli_args = prefill_cli_args_list | default([]) -%}
 {%- set default_accelerator_type = 'xpu' if node_config.system_name | default('') == 'b60' else 'nvidia' -%}
 {%- set accelerator_type = llmd_config.accelerator_type | default(default_accelerator_type, true) -%}

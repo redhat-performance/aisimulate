@@ -523,8 +523,18 @@ def _disaggregatedset_params(mode: str = "disagg") -> dict:
             "decode_gpus_per_worker": 2,
         },
         "params": {
-            "prefill": {"gpus_per_worker": 1},
-            "decode": {"gpus_per_worker": 2},
+            "prefill": {
+                "gpus_per_worker": 1,
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 1,
+                "data_parallel_size": 1,
+            },
+            "decode": {
+                "gpus_per_worker": 2,
+                "tensor_parallel_size": 2,
+                "pipeline_parallel_size": 1,
+                "data_parallel_size": 1,
+            },
         },
         "prefill_tensor_parallel_size": 1,
         "prefill_pipeline_parallel_size": 1,
@@ -670,14 +680,31 @@ def _render_disaggregatedset(**llmd_overrides) -> dict:
 
 @pytest.mark.unit
 def test_llmd_kustomize_disaggregatedset_honours_explicit_resource_name():
-    """An explicit name wins over the accelerator default."""
+    """An explicit name wins, and is asserted against the base at build time."""
     artifacts = _render_disaggregatedset(kustomize_disaggregatedset_name="team-pd")
 
     kustomization = yaml.safe_load(artifacts["kustomization.yaml"])
-    assert [patch["target"]["name"] for patch in kustomization["patches"]] == [
-        "team-pd",
-        "team-pd",
-    ]
+    path_patches = [patch for patch in kustomization["patches"] if "path" in patch]
+    assert [patch["target"]["name"] for patch in path_patches] == ["team-pd", "team-pd"]
+
+    # kustomize silently skips an unmatched target, so the explicit name is
+    # tested against the base DisaggregatedSet's metadata name first.
+    guards = [patch for patch in kustomization["patches"] if "patch" in patch]
+    assert len(guards) == 1
+    assert guards[0]["target"] == {
+        "group": "disaggregatedset.x-k8s.io",
+        "version": "v1",
+        "kind": "DisaggregatedSet",
+    }
+    assert yaml.safe_load(guards[0]["patch"]) == [{"op": "test", "path": "/metadata/name", "value": "team-pd"}]
+
+
+@pytest.mark.unit
+def test_llmd_kustomize_disaggregatedset_default_name_needs_no_build_guard():
+    """The resolved default matches its base, so no extra guard is emitted."""
+    kustomization = yaml.safe_load(_render_disaggregatedset()["kustomization.yaml"])
+
+    assert all("path" in patch for patch in kustomization["patches"])
 
 
 @pytest.mark.unit
@@ -847,6 +874,37 @@ def test_llmd_kustomize_disaggregatedset_counts_data_parallel_ranks_in_gpus():
     prefill = yaml.safe_load(artifacts["patch-prefill.yaml"])
     prefill_gpu = [op["value"] for op in prefill if op["op"] == "add" and "nvidia.com~1gpu" in op["path"]]
     assert prefill_gpu == ["2", "2"]
+
+
+@pytest.mark.unit
+def test_llmd_kustomize_disaggregatedset_counts_prefill_context_ranks_in_gpus():
+    """Prefill CP expands the worker, so the pod request must grow with it."""
+    params = _disaggregatedset_params()
+    params["params"]["prefill"].update({"tensor_parallel_size": 2, "context_parallel_size": 2})
+    params["prefill_tensor_parallel_size"] = 2
+
+    artifacts = render_backend_templates(
+        param_values=params,
+        backend="vllm",
+        # PCP is rendered from the versioned cli-args template.
+        version="0.20.1",
+        deployment_target="llm-d-kustomize",
+    )
+
+    prefill = yaml.safe_load(artifacts["patch-prefill.yaml"])
+    prefill_container = "/spec/roles/0/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0"
+    args = next(op["value"] for op in prefill if op["path"] == f"{prefill_container}/args")
+    pcp_index = args.index("--prefill-context-parallel-size")
+    assert args[pcp_index + 1] == "2"
+
+    prefill_gpu = [op["value"] for op in prefill if op["op"] == "add" and "nvidia.com~1gpu" in op["path"]]
+    # TP=2, PP=1, DP=1, CP=2 -> a four-GPU world.
+    assert prefill_gpu == ["4", "4"]
+
+    decode = yaml.safe_load(artifacts["patch-decode.yaml"])
+    decode_gpu = [op["value"] for op in decode if op["op"] == "add" and "nvidia.com~1gpu" in op["path"]]
+    # Decode has no CP here, so its count is unchanged.
+    assert decode_gpu == ["2", "2"]
 
 
 @pytest.mark.unit
