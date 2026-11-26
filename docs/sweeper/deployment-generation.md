@@ -357,8 +357,11 @@ to be applied from inside the checkout.
 | `disaggregatedset` | both roles are entries in one `DisaggregatedSet` (`disaggregatedset.x-k8s.io/v1`) | v1.0 and later P/D guides |
 
 `deployment` also selects an XPU base when `LlmdConfig.accelerator_type` is
-XPU. `disaggregatedset` defaults `LlmdConfig.kustomize_base_path` to the GPU
-vLLM P/D guide base, so set it explicitly for a different accelerator.
+XPU. `disaggregatedset` follows the same rule: it defaults
+`LlmdConfig.kustomize_base_path` to the GPU vLLM P/D guide base, or to
+`guides/pd-disaggregation/modelserver/xpu/vllm` (and its `rdma` overlay when
+`LlmdConfig.xpu_rdma_enabled` is set) for XPU. Set the path explicitly for any
+other base.
 
 `disaggregatedset` applies to disaggregated mode only; aggregated mode has no
 P/D split and renders the `Deployment` overlay. The two layouts are not
@@ -368,12 +371,25 @@ would replace `spec.roles` wholesale, because a CRD list has no merge key. The
 `target`, and each starts with a `test` op on the role name so a reordered base
 fails the build instead of patching the wrong role.
 
+The overlay also emits `name-reference.yaml` and loads it through
+`configurations:`. Kustomize has no built-in name reference for a
+`DisaggregatedSet`, so without it a `namePrefix` would rename the
+ServiceAccount while both role pod templates kept the unprefixed name.
+
 `LlmdConfig.kustomize_disaggregatedset_name` names the resource the patches
-address (default `pd-disagg-vllm`), and `LlmdConfig.kustomize_name_prefix`
-applies a prefix to the built resources. Neither layout pins an llm-d revision
-or an image: pass `LlmdConfig.vllm_image` with an immutable tag or digest, and
-record the llm-d revision you applied the overlay to. A layout/base mismatch
-fails at `kustomize build`, not at render time.
+address. It defaults to the guide's own name for the selected accelerator
+(`pd-disagg-vllm`, or `pd-disagg-xpu` for XPU); an explicit value always wins.
+Each role requests `tensor_parallel_size * pipeline_parallel_size *
+data_parallel_size` GPUs, and the GPU entries are patched in place so the
+base's CPU and memory requests and limits are preserved. Neither layout pins an
+llm-d revision or an image: pass `LlmdConfig.vllm_image` with an immutable tag
+or digest, and record the llm-d revision you applied the overlay to.
+
+A patch whose `target` matches no resource is skipped silently by
+`kustomize build`; it does not fail. When the base renames its
+`DisaggregatedSet` or changes the role order, the `test` op fails loudly, but a
+name that matches nothing leaves the base unpatched. Check the built output, or
+set `kustomize_disaggregatedset_name` to the name the base actually declares.
 
 ## FPM resource workload
 

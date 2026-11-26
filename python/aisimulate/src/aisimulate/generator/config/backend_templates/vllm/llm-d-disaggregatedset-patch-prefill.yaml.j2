@@ -13,7 +13,7 @@ why the first op is a `test`.
 {%- set model_name = service_config.model_path | default('meta-llama/Llama-3.1-8B') -%}
 {%- set served_name = service_config.served_model_name | default(model_name.split('/')[-1], true) -%}
 {%- set role_workers = prefill_workers | default(1) -%}
-{%- set role_gpu = (prefill_tensor_parallel_size | default(1) | int) * (prefill_pipeline_parallel_size | default(1) | int) -%}
+{%- set role_gpu = (prefill_tensor_parallel_size | default(1) | int) * (prefill_pipeline_parallel_size | default(1) | int) * (prefill_data_parallel_size | default(1) | int) -%}
 {%- set role_cli_args = prefill_cli_args_list | default([]) -%}
 {%- set default_accelerator_type = 'xpu' if node_config.system_name | default('') == 'b60' else 'nvidia' -%}
 {%- set accelerator_type = llmd_config.accelerator_type | default(default_accelerator_type, true) -%}
@@ -51,11 +51,12 @@ why the first op is a `test`.
     - --port=8000
     {% endif %}
 {% if not is_xpu %}
-- op: replace
-  path: /spec/roles/0/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/resources
-  value:
-    limits:
-      nvidia.com/gpu: "{{ role_gpu }}"
-    requests:
-      nvidia.com/gpu: "{{ role_gpu }}"
+{#- `add` on the GPU entries keeps the base's cpu/memory requests and limits.
+    `~1` escapes the `/` in the resource name (RFC 6901). -#}
+- op: add
+  path: /spec/roles/0/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/resources/limits/nvidia.com~1gpu
+  value: "{{ role_gpu }}"
+- op: add
+  path: /spec/roles/0/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/resources/requests/nvidia.com~1gpu
+  value: "{{ role_gpu }}"
 {% endif %}

@@ -828,7 +828,18 @@ def render_backend_templates(
         # strategic-merge key. Aggregated mode always renders a Deployment:
         # there is no P/D split to group.
         is_agg_mode = (context.get("DynConfig") or {}).get("mode", "disagg") == "agg"
-        layout = str((context.get("LlmdConfig") or {}).get("kustomize_layout") or "deployment").strip().lower()
+        layout_setting = (context.get("LlmdConfig") or {}).get("kustomize_layout")
+        if layout_setting is None:
+            layout = "deployment"
+        elif not isinstance(layout_setting, str):
+            # A false or numeric value is a configuration error, not "unset":
+            # silently treating it as the default would deploy a different
+            # layout than the caller asked for.
+            raise ValueError(
+                f"LlmdConfig.kustomize_layout must be 'deployment' or 'disaggregatedset', got {layout_setting!r}"
+            )
+        else:
+            layout = layout_setting.strip().lower()
         if layout not in {"deployment", "disaggregatedset"}:
             raise ValueError(
                 f"unknown LlmdConfig.kustomize_layout {layout!r}; expected 'deployment' or 'disaggregatedset'"
@@ -836,6 +847,7 @@ def render_backend_templates(
         if layout == "disaggregatedset" and not is_agg_mode:
             kustomize_templates = [
                 ("llm-d-disaggregatedset-kustomization.yaml.j2", "kustomization.yaml"),
+                ("llm-d-disaggregatedset-name-reference.yaml.j2", "name-reference.yaml"),
                 ("llm-d-disaggregatedset-patch-decode.yaml.j2", "patch-decode.yaml"),
                 ("llm-d-disaggregatedset-patch-prefill.yaml.j2", "patch-prefill.yaml"),
             ]

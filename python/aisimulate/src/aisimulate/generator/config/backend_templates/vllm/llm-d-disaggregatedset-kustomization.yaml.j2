@@ -11,14 +11,37 @@ for a CRD list, so a strategic merge would replace `spec.roles` wholesale. Each
 patch states its target explicitly and begins with a `test` op on the role name,
 so a base whose role order changes fails the build instead of patching the wrong
 role.
+
+Kustomize has no built-in name reference for a DisaggregatedSet, so a
+`namePrefix` renames the ServiceAccount without rewriting the pod templates
+that reference it. `configurations` loads the reference mapping that keeps both
+roles bound to the built account.
 #}
 {%- set llmd_config = LlmdConfig | default({}) -%}
-{%- set resource_name = llmd_config.kustomize_disaggregatedset_name | default('pd-disagg-vllm', true) -%}
+{%- set node_config = NodeConfig | default({}) -%}
+{%- set default_accelerator_type = 'xpu' if node_config.system_name | default('') == 'b60' else 'nvidia' -%}
+{%- set accelerator_type = llmd_config.accelerator_type | default(default_accelerator_type, true) -%}
+{%- set is_xpu = accelerator_type in ['xpu', 'intel'] -%}
+{%- set xpu_rdma_enabled = llmd_config.xpu_rdma_enabled | default(false) -%}
+{%- if is_xpu and xpu_rdma_enabled -%}
+{%- set default_base_path = 'guides/pd-disaggregation/modelserver/xpu/vllm/rdma' -%}
+{%- elif is_xpu -%}
+{%- set default_base_path = 'guides/pd-disaggregation/modelserver/xpu/vllm' -%}
+{%- else -%}
+{%- set default_base_path = 'guides/pd-disaggregation/modelserver/gpu/vllm/base' -%}
+{%- endif -%}
+{#- Each accelerator's guide names its DisaggregatedSet differently, so the
+    default follows the base and an explicit name always wins. -#}
+{%- set default_resource_name = 'pd-disagg-xpu' if is_xpu else 'pd-disagg-vllm' -%}
+{%- set resource_name = llmd_config.kustomize_disaggregatedset_name | default(default_resource_name, true) -%}
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-  - {{ llmd_config.kustomize_base_path | default('guides/pd-disaggregation/modelserver/gpu/vllm/base', true) }}
+  - {{ llmd_config.kustomize_base_path | default(default_base_path, true) }}
+
+configurations:
+  - name-reference.yaml
 
 {% if llmd_config.kustomize_name_prefix | default('', true) %}
 namePrefix: {{ llmd_config.kustomize_name_prefix }}

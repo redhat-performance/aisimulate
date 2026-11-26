@@ -7,6 +7,7 @@ import pytest
 import yaml
 
 from aisimulate.generator.rendering.engine import render_backend_templates
+from aisimulate.generator.rendering.schemas import apply_defaults
 
 
 @pytest.mark.unit
@@ -545,12 +546,18 @@ def test_llmd_kustomize_disaggregatedset_layout():
         deployment_target="llm-d-kustomize",
     )
 
-    assert set(artifacts) >= {"kustomization.yaml", "patch-decode.yaml", "patch-prefill.yaml"}
+    assert set(artifacts) >= {
+        "kustomization.yaml",
+        "name-reference.yaml",
+        "patch-decode.yaml",
+        "patch-prefill.yaml",
+    }
     assert "patch-vllm.yaml" not in artifacts
     assert "llm-d-values.yaml" not in artifacts
 
     kustomization = yaml.safe_load(artifacts["kustomization.yaml"])
     assert kustomization["resources"] == ["guides/pd-disaggregation/modelserver/gpu/vllm/base"]
+    assert kustomization["configurations"] == ["name-reference.yaml"]
     assert [patch["path"] for patch in kustomization["patches"]] == [
         "patch-decode.yaml",
         "patch-prefill.yaml",
@@ -575,10 +582,13 @@ def test_llmd_kustomize_disaggregatedset_layout():
     decode_args = decode_ops[f"{decode_container}/args"]
     assert "--port=8200" in decode_args
     assert any('"kv_role":"kv_consumer"' in arg for arg in decode_args)
-    assert decode_ops[f"{decode_container}/resources"] == {
-        "limits": {"nvidia.com/gpu": "2"},
-        "requests": {"nvidia.com/gpu": "2"},
+    # The GPU entries are patched in place, so the base's cpu/memory stay.
+    decode_gpu = {op["path"]: op["value"] for op in decode if op["op"] == "add" and "nvidia.com~1gpu" in op["path"]}
+    assert decode_gpu == {
+        f"{decode_container}/resources/limits/nvidia.com~1gpu": "2",
+        f"{decode_container}/resources/requests/nvidia.com~1gpu": "2",
     }
+    assert f"{decode_container}/resources" not in decode_ops
 
     prefill = yaml.safe_load(artifacts["patch-prefill.yaml"])
     assert prefill[0] == {"op": "test", "path": "/spec/roles/0/name", "value": "prefill"}
@@ -589,9 +599,10 @@ def test_llmd_kustomize_disaggregatedset_layout():
     assert any('"kv_role":"kv_producer"' in arg for arg in prefill_args)
     # every token budget renders 64-aligned (owner decision 2026-09-24)
     assert "5504" in prefill_args
-    assert prefill_ops[f"{prefill_container}/resources"] == {
-        "limits": {"nvidia.com/gpu": "1"},
-        "requests": {"nvidia.com/gpu": "1"},
+    prefill_gpu = {op["path"]: op["value"] for op in prefill if op["op"] == "add" and "nvidia.com~1gpu" in op["path"]}
+    assert prefill_gpu == {
+        f"{prefill_container}/resources/limits/nvidia.com~1gpu": "1",
+        f"{prefill_container}/resources/requests/nvidia.com~1gpu": "1",
     }
 
 
@@ -638,6 +649,171 @@ def test_llmd_kustomize_rejects_unknown_layout():
     params = _disaggregatedset_params()
     params["LlmdConfig"]["kustomize_layout"] = "statefulset"
 
+    with pytest.raises(ValueError, match="kustomize_layout"):
+        render_backend_templates(
+            param_values=params,
+            backend="vllm",
+            deployment_target="llm-d-kustomize",
+        )
+
+
+def _render_disaggregatedset(**llmd_overrides) -> dict:
+    """Render the DisaggregatedSet overlay with LlmdConfig overrides."""
+    params = _disaggregatedset_params()
+    params["LlmdConfig"].update(llmd_overrides)
+    return render_backend_templates(
+        param_values=params,
+        backend="vllm",
+        deployment_target="llm-d-kustomize",
+    )
+
+
+@pytest.mark.unit
+def test_llmd_kustomize_disaggregatedset_honours_explicit_resource_name():
+    """An explicit name wins over the accelerator default."""
+    artifacts = _render_disaggregatedset(kustomize_disaggregatedset_name="team-pd")
+
+    kustomization = yaml.safe_load(artifacts["kustomization.yaml"])
+    assert [patch["target"]["name"] for patch in kustomization["patches"]] == [
+        "team-pd",
+        "team-pd",
+    ]
+
+
+@pytest.mark.unit
+def test_llmd_kustomize_disaggregatedset_prefix_keeps_the_service_account_binding():
+    """A prefix renames the account, so the reference mapping must ship too."""
+    artifacts = _render_disaggregatedset(kustomize_name_prefix="configiq-")
+
+    kustomization = yaml.safe_load(artifacts["kustomization.yaml"])
+    assert kustomization["namePrefix"] == "configiq-"
+    assert kustomization["configurations"] == ["name-reference.yaml"]
+
+    references = yaml.safe_load(artifacts["name-reference.yaml"])
+    assert references == {
+        "nameReference": [
+            {
+                "kind": "ServiceAccount",
+                "version": "v1",
+                "fieldSpecs": [
+                    {
+                        "path": ("spec/roles/spec/leaderWorkerTemplate/workerTemplate/spec/serviceAccountName"),
+                        "kind": "DisaggregatedSet",
+                        "group": "disaggregatedset.x-k8s.io",
+                        "version": "v1",
+                    }
+                ],
+            }
+        ]
+    }
+
+
+@pytest.mark.unit
+def test_llmd_kustomize_disaggregatedset_xpu_follows_the_xpu_guide():
+    """XPU selects its own base, resource name, and KV buffer device."""
+    artifacts = _render_disaggregatedset(
+        accelerator_type="xpu",
+        xpu_kv_buffer_device="cpu",
+    )
+
+    kustomization = yaml.safe_load(artifacts["kustomization.yaml"])
+    assert kustomization["resources"] == ["guides/pd-disaggregation/modelserver/xpu/vllm"]
+    assert [patch["target"]["name"] for patch in kustomization["patches"]] == [
+        "pd-disagg-xpu",
+        "pd-disagg-xpu",
+    ]
+
+    for artifact in ("patch-decode.yaml", "patch-prefill.yaml"):
+        ops = yaml.safe_load(artifacts[artifact])
+        # XPU shapes devices with ResourceClaimTemplates, so no GPU op applies.
+        assert not any("resources" in op["path"] for op in ops)
+        args = next(op["value"] for op in ops if op["path"].endswith("/args"))
+        assert any('"kv_buffer_device":"cpu"' in arg for arg in args)
+
+    rdma = yaml.safe_load(_render_disaggregatedset(accelerator_type="xpu", xpu_rdma_enabled=True)["kustomization.yaml"])
+    assert rdma["resources"] == ["guides/pd-disaggregation/modelserver/xpu/vllm/rdma"]
+
+
+@pytest.mark.unit
+def test_llmd_kustomize_disaggregatedset_uses_base_path_override():
+    """An explicit base path replaces the accelerator default."""
+    artifacts = _render_disaggregatedset(kustomize_base_path="guides/custom/pd/base")
+
+    kustomization = yaml.safe_load(artifacts["kustomization.yaml"])
+    assert kustomization["resources"] == ["guides/custom/pd/base"]
+
+
+@pytest.mark.unit
+def test_llmd_kustomize_explicit_deployment_layout_still_renders_deployments():
+    """An explicit deployment layout in disaggregated mode is not overridden."""
+    artifacts = _render_disaggregatedset(kustomize_layout="deployment")
+
+    assert "name-reference.yaml" not in artifacts
+    kustomization = yaml.safe_load(artifacts["kustomization.yaml"])
+    assert kustomization["patches"] == [
+        {"path": "patch-decode.yaml"},
+        {"path": "patch-prefill.yaml"},
+    ]
+    assert yaml.safe_load(artifacts["patch-decode.yaml"])["kind"] == "Deployment"
+
+
+@pytest.mark.unit
+def test_llmd_kustomize_disaggregatedset_counts_data_parallel_ranks_in_gpus():
+    """Each DP rank runs its own TP x PP GPU set, and the args request them."""
+    params = _disaggregatedset_params()
+    params["params"]["decode"].update({"tensor_parallel_size": 2, "data_parallel_size": 2})
+    params["params"]["prefill"].update({"tensor_parallel_size": 1, "data_parallel_size": 2})
+    # The planner states each parallelism input once; keep the top-level
+    # compatibility keys in step with the worker params, as it does.
+    params["decode_data_parallel_size"] = 2
+    params["prefill_data_parallel_size"] = 2
+
+    artifacts = render_backend_templates(
+        param_values=params,
+        backend="vllm",
+        deployment_target="llm-d-kustomize",
+    )
+
+    decode = yaml.safe_load(artifacts["patch-decode.yaml"])
+    decode_paths = {op["path"]: op["value"] for op in decode if op["op"] == "replace"}
+    decode_container = "/spec/roles/1/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0"
+    decode_args = decode_paths[f"{decode_container}/args"]
+    dp_index = decode_args.index("--data-parallel-size")
+    assert decode_args[dp_index + 1] == "2"
+
+    decode_gpu = {
+        op["path"].rsplit("/", 1)[-1]: op["value"]
+        for op in decode
+        # TP=2, PP=1, DP=2 -> two ranks of two GPUs each.
+        if op["op"] == "add" and "nvidia.com~1gpu" in op["path"]
+    }
+    assert decode_gpu == {"nvidia.com~1gpu": "4"}
+
+    prefill = yaml.safe_load(artifacts["patch-prefill.yaml"])
+    prefill_gpu = [op["value"] for op in prefill if op["op"] == "add" and "nvidia.com~1gpu" in op["path"]]
+    assert prefill_gpu == ["2", "2"]
+
+
+@pytest.mark.unit
+def test_llmd_kustomize_layout_defaults_to_deployment_only_when_unset():
+    """Absent or null selects the default; a non-string value is an error."""
+    assert apply_defaults("LlmdConfig", {})["kustomize_layout"] == "deployment"
+
+    params = _disaggregatedset_params()
+    params["LlmdConfig"]["kustomize_layout"] = None
+    artifacts = render_backend_templates(
+        param_values=params,
+        backend="vllm",
+        deployment_target="llm-d-kustomize",
+    )
+    kustomization = yaml.safe_load(artifacts["kustomization.yaml"])
+    assert kustomization["patches"] == [
+        {"path": "patch-decode.yaml"},
+        {"path": "patch-prefill.yaml"},
+    ]
+
+    params = _disaggregatedset_params()
+    params["LlmdConfig"]["kustomize_layout"] = False
     with pytest.raises(ValueError, match="kustomize_layout"):
         render_backend_templates(
             param_values=params,
