@@ -39,6 +39,8 @@ from aisim_core.sdk.config_builders import normalize_nextn
 from aisim_core.sdk.speculation.base import NullScheme
 from aisim_core.sdk.speculation.mtp import MTPScheme
 
+from .helpers import calc_vllm_swa_batch_cap
+
 logger = logging.getLogger(__name__)
 
 
@@ -674,3 +676,65 @@ class BaseModel:
             else:
                 hi = mid
         return lo
+
+    def _vllm_swa_batch_capacity(
+        self,
+        kv_budget_bytes: float,
+        *,
+        window_size: int,
+        swa_per_token: float,
+        global_per_token: float,
+    ) -> int | None:
+        """Token count assuming the use of vLLM block-aligned SWA, or ``None``
+        if vLLM or a max sequence length isn't specified.
+
+        For a given memory budget, returns the effective token capacity when
+        the model runs on vLLM AND ``max_model_len`` is set; returns ``None``
+        otherwise so the caller falls back to its idealized inverse. Subclasses
+        compute the model-specific ``swa_per_token`` and ``global_per_token``
+        byte rates and call this function to perform the token calculation.
+
+        vLLM v0.14.0 ``SlidingWindowSpec`` reserves blocks based on the maximum
+        tokens a single request can present to SWA layers in any iteration:
+        ``sliding_window - 1`` previously cached tokens plus up to
+        ``max_num_batched_tokens`` new tokens, capped at ``max_model_len``.
+
+        ``calc_vllm_swa_batch_cap`` spreads vLLM's fixed SWA block reservation
+        across ``max_model_len`` as an effective per-token cost; that is not the
+        same as inverting :meth:`get_kvcache_bytes_per_sequence`. Usable capacity
+        (plan checks / scheduler blocks) is clamped so the returned token count
+        still fits that byte-accounting curve for the same budget.
+        """
+        if getattr(self, "_backend_name", None) != "vllm":
+            return None
+        max_model_len = getattr(self.config, "max_model_len", None)
+        if not max_model_len or window_size < 1:
+            return None
+        # vLLM SlidingWindowSpec.max_memory_usage_bytes (v0.14+) asserts
+        # decode_context_parallel_size == 1. Do not return the windowed
+        # reservation estimate under DCP; full-attention+DCP hybrid layouts are
+        # a separate allocator path this helper does not model. Known
+        # approximation: hybrid group padding (e.g. Step-3.7 33 SWA / 12 global)
+        # is not recreated here; only the SlidingWindowSpec reservation + clamp.
+        dcp = int(getattr(self.config, "dcp_size", None) or 1)
+        if dcp > 1:
+            raise NotImplementedError(
+                f"vLLM SlidingWindowSpec KV capacity does not support decode context "
+                f"parallelism (dcp_size={dcp}); requires decode_context_parallel_size == 1"
+            )
+
+        block_size = getattr(self.config, "kv_block_size", None) or 16
+        max_batched = getattr(self.config, "max_num_batched_tokens", None) or max_model_len
+
+        # Fixed SWA reservation, spread across max_model_len (SlidingWindowSpec).
+        reservation_based = calc_vllm_swa_batch_cap(
+            window_size,
+            max_batched,
+            max_model_len,
+            global_per_token,
+            swa_per_token,
+            block_size,
+            kv_budget_bytes,
+        )
+        # Do not let reservation-based capacity exceed the resident-byte inverse.
+        return min(reservation_based, self.get_kvcache_max_tokens(kv_budget_bytes))

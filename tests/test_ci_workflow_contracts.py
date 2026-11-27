@@ -5213,7 +5213,10 @@ def test_nightly_artifact_handoff_matches_fpe_and_accuracy_consumers():
     ],
 )
 @pytest.mark.parametrize("package", ["aisim", "aisimulate"])
-def test_nightly_provenance_and_checksums_pass_real_accuracy_consumer(tmp_path, source_ref, event, package):
+@pytest.mark.parametrize("consumer_workflow", ["e2e-accuracy-branch.yml", "fpm-accuracy-branch.yml"])
+def test_nightly_provenance_and_checksums_pass_real_accuracy_consumer(
+    tmp_path, source_ref, event, package, consumer_workflow
+):
     (tmp_path / "scripts").symlink_to(REPOSITORY_ROOT / "scripts", target_is_directory=True)
     directory = tmp_path / "accuracy-wheel"
     directory.mkdir()
@@ -5269,9 +5272,7 @@ def test_nightly_provenance_and_checksums_pass_real_accuracy_consumer(tmp_path, 
     assert provenance["version"] == "0.12.0.dev20260917"
     assert provenance["artifacts"][wheel.name] == hashlib.sha256(wheel.read_bytes()).hexdigest()
     consumer = next(
-        step["run"]
-        for step in _workflow("e2e-accuracy-branch.yml")["jobs"]["wheel"]["steps"]
-        if step.get("id") == "verify"
+        step["run"] for step in _workflow(consumer_workflow)["jobs"]["wheel"]["steps"] if step.get("id") == "verify"
     ).replace("/opt/python/cp312-cp312/bin/python", shlex.quote(sys.executable))
 
     def verify():
@@ -5284,6 +5285,24 @@ def test_nightly_provenance_and_checksums_pass_real_accuracy_consumer(tmp_path, 
         assert "nightly wheel provenance mismatch" in result.stderr
         return
     assert result.returncode == 0, result.stdout + result.stderr
+    # Migration window: accept legacy aisimulate producer provenance too.
+    provenance["repository"] = "ai-dynamo/aisimulate"
+    (directory / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+    checksums = {
+        name: hashlib.sha256((directory / name).read_bytes()).hexdigest() for name in (wheel.name, "provenance.json")
+    }
+    (directory / "SHA256SUMS.txt").write_text("".join(f"{digest}  {name}\n" for name, digest in checksums.items()))
+    assert verify().returncode == 0, "legacy ai-dynamo/aisimulate provenance must still verify"
+    provenance["repository"] = "ai-dynamo/unrelated"
+    (directory / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+    checksums["provenance.json"] = hashlib.sha256((directory / "provenance.json").read_bytes()).hexdigest()
+    (directory / "SHA256SUMS.txt").write_text("".join(f"{digest}  {name}\n" for name, digest in checksums.items()))
+    assert verify().returncode != 0
+    assert "nightly wheel provenance mismatch" in verify().stderr
+    provenance["repository"] = "ai-dynamo/aisim"
+    (directory / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+    checksums["provenance.json"] = hashlib.sha256((directory / "provenance.json").read_bytes()).hexdigest()
+    (directory / "SHA256SUMS.txt").write_text("".join(f"{digest}  {name}\n" for name, digest in checksums.items()))
     wheel.write_bytes(b"tampered wheel")
     assert verify().returncode != 0
     wheel.write_bytes(b"fixture wheel")

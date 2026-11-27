@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 import re
 import warnings
 from fnmatch import fnmatchcase
@@ -1042,6 +1043,10 @@ def _apply_model_quant_defaults(
     moe_was_unset = model_config.moe_quant_mode is None
 
     inferred = _infer_quant_modes_from_raw_config(raw_config, architecture)
+
+    # Auto path: keep checkpoint-inferred modes (including FP8 KV) when the
+    # caller left them unset. Explicit cache-dtype selections win below because
+    # setattr only fills None fields.
     applied: list[str] = []
     for key, value in inferred.items():
         if getattr(model_config, key, None) is None:
@@ -1505,3 +1510,34 @@ def mtp_scale_factor(nextn: int, num_layers: int) -> float:
     if nextn <= 0:
         return 1.0
     return (nextn + num_layers) / num_layers
+
+
+def calc_vllm_swa_batch_cap(
+    window_size: int,
+    max_batched: int,
+    max_model_len: int,
+    global_per_token: float,
+    swa_per_token: float,
+    block_size: int,
+    kv_budget_bytes: float,
+) -> int:
+    """
+    Calculate the max number of tokens in the KV Cache for a  model using SWA
+    assuming that vLLM is being used as the backend.
+    """
+    budget = float(kv_budget_bytes)
+    if budget <= 0.0:
+        return 0
+    if max_model_len <= 0 or block_size <= 0:
+        raise ValueError("max_model_len and block_size must be positive")
+
+    swa_seq_tokens = min(window_size - 1 + max_batched, max_model_len)
+    swa_reservation = (math.ceil(swa_seq_tokens / block_size) + 1) * block_size
+    # Spread the fixed SWA block reservation across block-aligned max_model_len
+    # (vLLM pages the full context); keep the SWA allocation rounding above.
+    aligned_max_model_len = math.ceil(max_model_len / block_size) * block_size
+
+    effective_per_token = global_per_token + swa_per_token * swa_reservation / aligned_max_model_len
+    if effective_per_token <= 0.0:
+        return 0
+    return int(budget / effective_per_token)

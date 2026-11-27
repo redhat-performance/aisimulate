@@ -82,6 +82,38 @@ rank-local KV capacity. The `aisim predict` YAML exposes it at
 does not estimate the reservation; callers must supply a value from a source
 they trust.
 
+### Hybrid SWA context and block size
+
+`estimate_kv_cache(..., context_length=..., kv_block_size=...)` and
+`estimate_num_gpu_blocks(..., context_length=..., scheduler_block_size=...)`
+forward those knobs into `ModelConfig.max_model_len` and
+`ModelConfig.kv_block_size`. `max_num_tokens` / `max_num_batched_tokens` become
+`ModelConfig.max_num_batched_tokens`. Non-SWA models ignore
+`context_length` for capacity; token capacity stays the idealized
+`get_kvcache_max_tokens` inverse.
+
+On the **vLLM** backend only, hybrid sliding-window models (Gemma 4 mix,
+gpt-oss, Muse Glimmer, Step-3.7) use vLLM's `SlidingWindowSpec` block
+reservation when `max_model_len` is set: SWA layers reserve
+`ceil(min(window - 1 + max_num_batched_tokens, max_model_len) / block_size) + 1`
+blocks, spread across block-aligned `max_model_len`, then clamp so the returned
+token count still fits `get_kvcache_bytes_per_sequence`. Unset `max_model_len`,
+or any non-vLLM backend, keeps the idealized inverse. Decode context
+parallelism with `dcp_size > 1` is rejected on that path (Python
+`estimate_kv_cache` / `from_request` and Rust analytical rematerialization that
+forwards `context_length` with `dcp > 1`). Existing replay configs that combine
+vLLM hybrid SWA, a set `max_model_len`, and `dcp > 1` with automatic
+`num_gpu_blocks` must set an explicit block count or keep `dcp == 1`.
+
+AIC capacity materialization passes engine `max_model_len` as
+`context_length` and engine `block_size` as the scheduler block size on the
+non-FPM path, including Rust rematerialization when
+`num_gpu_blocks_is_explicit` is false (analytical and FPM). The Rust scalar
+`KvCacheEstimateRequest` forwards optional `engine.kv_block_size` into Python,
+but does not carry `context_length` / `max_model_len`, so callers of that
+request type must set those knobs through Python `estimate_kv_cache` or AIC
+replay rematerialization instead.
+
 Serialized Rust requests and estimates that omit the field remain compatible
 because deserialization defaults it to zero. See [Rust literal migration](../aic-backward-compatibility/migration.md#rust-resource-and-memory-literals)
 for required source changes to request and memory-breakdown structs.
@@ -361,7 +393,11 @@ grouped and runtime-memory profiles to this native budget method.
 it and the
 legacy Rust scalar `KvCacheEstimate` transport reject grouped profiles; use the
 groups and shared byte budget instead. Existing complete linear declarations
-keep their budget calculation and serialized shape.
+keep their budget calculation and serialized shape. On the non-FPM native path,
+the same `context_length` argument becomes `ModelConfig.max_model_len`, and
+`kv_block_size` / `scheduler_block_size` become `ModelConfig.kv_block_size`, so
+vLLM hybrid SWA models can apply the block-reservation rule in
+[Hybrid SWA context and block size](#hybrid-swa-context-and-block-size).
 
 Grouped native execution supports aggregated vLLM, PP1/CP1, HBM-only cache and
 non-speculative decoding, cold or with prefix caching. Grouped prefix caching

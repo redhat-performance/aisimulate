@@ -45,6 +45,13 @@ def test_model_config_normalizes_kernel_backend_enums():
     assert model_config.moe_backend is common.MoEBackend.megamoe
 
 
+@pytest.mark.parametrize("field", ["max_model_len", "max_num_batched_tokens", "kv_block_size"])
+@pytest.mark.parametrize("bad", [0, -1, True, 1.5, "16"])
+def test_model_config_rejects_non_positive_or_non_integer_swa_scheduler_fields(field, bad):
+    with pytest.raises(ValueError, match=f"{field} must be a positive integer"):
+        config.ModelConfig(**{field: bad})
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [("attention_backend", "torch"), ("moe_backend", "triton")],
@@ -991,8 +998,12 @@ class TestGptOssHybridKVCache:
         tp_size: int = 1,
         kvcache_quant_mode: common.KVCacheQuantMode = common.KVCacheQuantMode.fp8,
         nextn: int = 0,
+        dcp_size: int | None = None,
     ):
-        model_config = config.ModelConfig(tp_size=tp_size, moe_tp_size=tp_size, moe_ep_size=1)
+        kwargs = dict(tp_size=tp_size, moe_tp_size=tp_size, moe_ep_size=1)
+        if dcp_size is not None:
+            kwargs["dcp_size"] = dcp_size
+        model_config = config.ModelConfig(**kwargs)
         model_config.kvcache_quant_mode = kvcache_quant_mode
         model_config.nextn = nextn
         return get_model(cls.MODEL, model_config, backend_name="vllm")
@@ -1005,6 +1016,72 @@ class TestGptOssHybridKVCache:
 
         all_global = seq_len * self.LAYERS * 2 * self.KV_HEADS * self.HEAD_SIZE
         assert got < 0.52 * all_global
+
+    def test_vllm_swa_capacity_rejects_dcp_greater_than_one(self):
+        """vLLM SlidingWindowSpec requires decode_context_parallel_size == 1.
+
+        gpt-oss supports DCP on vLLM for timing, but the windowed reservation
+        capacity path must not silently return a SlidingWindowSpec estimate.
+        """
+        # 8 KV heads with tp=16 => replication 2, so dcp=2 is constructible.
+        model = self._model(tp_size=16, dcp_size=2)
+        model.config.max_model_len = 4096
+        with pytest.raises(NotImplementedError, match="SlidingWindowSpec"):
+            model.get_kvcache_batch_capacity(50 * (1 << 30), 256)
+        # dcp_size == 1 keeps the existing windowed reservation path.
+        dcp1 = self._model(tp_size=16, dcp_size=1)
+        dcp1.config.max_model_len = 4096
+        assert dcp1.get_kvcache_batch_capacity(50 * (1 << 30), 256) > 0
+
+    def test_vllm_swa_batch_capacity_dispatch_and_fallbacks(self):
+        """vLLM + max_model_len uses reservation; unset / non-vLLM keep the inverse."""
+        from aisim_core.sdk.models.helpers import calc_vllm_swa_batch_cap
+
+        budget = 50 * (1 << 30)
+        model = self._model()
+        model.config.max_model_len = 4096
+        model.config.max_num_batched_tokens = 8192
+        model.config.kv_block_size = 16
+        bytes_per_elem = model.config.kvcache_quant_mode.value.memory
+        n_kv = (model._num_kv_heads + model.config.tp_size - 1) // model.config.tp_size
+        per_layer = n_kv * model._head_size * 2 * bytes_per_elem
+        num_swa = model._num_layers // model._GPTOSS_ATTN_SCALE_FACTOR
+        num_global = model._num_layers - num_swa
+        expected = calc_vllm_swa_batch_cap(
+            model._GPTOSS_WINDOW_SIZE,
+            8192,
+            4096,
+            num_global * per_layer,
+            num_swa * per_layer,
+            16,
+            budget,
+        )
+        assert model.get_kvcache_batch_capacity(budget, 256) == min(expected, model.get_kvcache_max_tokens(budget))
+
+        unset = self._model()
+        assert unset.get_kvcache_batch_capacity(budget, 256) == unset.get_kvcache_max_tokens(budget)
+
+        non_vllm = get_model(
+            self.MODEL,
+            config.ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1),
+            backend_name="trtllm",
+        )
+        non_vllm.config.max_model_len = 4096
+        assert non_vllm.get_kvcache_batch_capacity(budget, 256) == non_vllm.get_kvcache_max_tokens(budget)
+
+    def test_non_gpt_oss_moe_skips_vllm_swa_reservation(self):
+        """Non-gpt-oss MOEModel architectures must not take the SlidingWindowSpec path."""
+        model = get_model(
+            "Qwen/Qwen3-30B-A3B",
+            config.ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1),
+            backend_name="vllm",
+        )
+        model.config.max_model_len = 4096
+        model.config.max_num_batched_tokens = 8192
+        model.config.kv_block_size = 16
+        budget = 20 * (1 << 30)
+        assert model.architecture != "GptOssForCausalLM"
+        assert model.get_kvcache_batch_capacity(budget, 256) == model.get_kvcache_max_tokens(budget)
 
     @pytest.mark.parametrize(
         ("tp_size", "kvcache_quant_mode"),
@@ -1257,6 +1334,17 @@ class TestQuantizationModes:
 
         assert model_config.kvcache_quant_mode == common.KVCacheQuantMode.fp8
         assert model_config.fmha_quant_mode == common.FMHAQuantMode.bfloat16
+
+    @pytest.mark.parametrize("backend_name", ["vllm", "sglang"])
+    def test_deepseek_v41_keeps_fp8_kvcache_on_vllm_and_sglang(self, backend_name):
+        model_config = config.ModelConfig()
+        models._apply_model_quant_defaults(
+            model_config,
+            {},
+            "DeepseekV41ForCausalLM",
+            backend_name,
+        )
+        assert model_config.kvcache_quant_mode == common.KVCacheQuantMode.fp8
 
 
 class TestMOEModelFP8BlockQuantizationValidation:

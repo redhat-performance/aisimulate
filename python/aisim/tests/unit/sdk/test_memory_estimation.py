@@ -19,6 +19,7 @@ checkable parity assertion for the port.
 
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -32,8 +33,8 @@ pytestmark = pytest.mark.unit
 # extension (e.g. the FPM pyclass).
 pytest.importorskip("aisim_core")
 
-from aisim.sdk import memory
-from aisim_core.sdk.models.helpers import _apply_model_quant_defaults
+import aisim_core.sdk.memory as memory
+import aisim_core.sdk.models as models
 
 _GIB = 1 << 30
 
@@ -101,6 +102,36 @@ def test_estimate_num_gpu_blocks_rejects_non_positive_or_non_integer_block_size(
                 scheduler_block_size=bad,
                 **common,
             )
+
+
+def test_estimate_num_gpu_blocks_forwards_scheduler_block_size_as_kv_block_size(monkeypatch):
+    received = {}
+
+    def _spy(*args, **kwargs):
+        received.update(kwargs)
+        return {
+            "total_kv_size_tokens": 1024,
+            "total_kv_size_bytes": 1024,
+            "source": "native",
+            "cache_layout": "linear",
+            "tolerance_adjusted": None,
+        }
+
+    monkeypatch.setattr(memory, "estimate_kv_cache", _spy)
+    assert (
+        memory.estimate_num_gpu_blocks(
+            "Qwen/Qwen3-32B",
+            "h200_sxm",
+            "vllm",
+            scheduler_block_size=64,
+            max_num_tokens=8192,
+            max_batch_size=256,
+            memory_fraction_kind="of_total",
+            memory_fraction_value=0.9,
+        )
+        == 16
+    )
+    assert received["kv_block_size"] == 64
 
 
 # --------------------------------------------------------------------------- #
@@ -205,7 +236,7 @@ def test_native_zero_per_token_raises():
 def test_native_capacity_discloses_resolved_kv_precision(monkeypatch, override, resolved, token_capacity):
     def get_model(_path, config, backend):
         # Exercise real default resolution for an FP8 checkpoint with no KV declaration.
-        _apply_model_quant_defaults(config, {"quant_algo": "fp8"}, "Qwen3ForCausalLM", backend)
+        models._apply_model_quant_defaults(config, {"quant_algo": "fp8"}, "Qwen3ForCausalLM", backend)
         # K and V, eight layers, two KV heads, head dimension 64.
         bytes_per_token = 2 * 8 * 2 * 64 * config.kvcache_quant_mode.value.memory
         return SimpleNamespace(
@@ -1035,6 +1066,79 @@ def test_estimate_kv_cache_rejects_malformed_context_parallel_sizes_before_any_b
         )
 
 
+def test_estimate_kv_cache_rejects_zero_kv_block_size_before_naive_fallback(monkeypatch):
+    # kv_block_size=0 must fail at the entrypoint: a native-construction error
+    # would otherwise be swallowed when allow_naive_fallback is set and the
+    # naive path has usable HF metadata.
+    def _never(*args, **kwargs):
+        raise AssertionError("model build must not be reached")
+
+    monkeypatch.setattr(memory.KVCacheEstimator, "from_request", classmethod(_never))
+    monkeypatch.setattr(memory.NaiveKVCacheEstimator, "_load_config", lambda *a, **k: dict(_RAW_UNSUPPORTED))
+    with pytest.raises(ValueError, match="kv_block_size must be a positive integer"):
+        memory.estimate_kv_cache(
+            "foo/bar-unknown-arch",
+            "h200_sxm",
+            "vllm",
+            max_num_tokens=8192,
+            max_batch_size=256,
+            memory_fraction_kind="of_total",
+            memory_fraction_value=0.9,
+            gpu_memory_capacity_bytes_override=200 * _GIB,
+            allow_naive_fallback=True,
+            kv_block_size=0,
+        )
+
+
+@pytest.mark.parametrize("param", ["context_length", "kv_block_size"])
+@pytest.mark.parametrize("bad", [0, -1, True, 1.5])
+def test_estimate_kv_cache_rejects_invalid_context_length_and_kv_block_size(monkeypatch, param, bad):
+    def _never(*args, **kwargs):
+        raise AssertionError("model build must not be reached")
+
+    monkeypatch.setattr(memory.KVCacheEstimator, "from_request", classmethod(_never))
+    monkeypatch.setattr(memory.NaiveKVCacheEstimator, "from_model_path", classmethod(_never))
+    with pytest.raises(ValueError, match=f"{param} must be a positive integer"):
+        memory.estimate_kv_cache(
+            "foo/bar",
+            "h200_sxm",
+            "vllm",
+            max_num_tokens=8192,
+            max_batch_size=256,
+            memory_fraction_kind="of_total",
+            memory_fraction_value=0.9,
+            allow_naive_fallback=True,
+            **{param: bad},
+        )
+
+
+@pytest.mark.parametrize("param", ["max_model_len", "kv_block_size"])
+@pytest.mark.parametrize("bad", [0, -1, True, 1.5])
+def test_from_request_rejects_invalid_max_model_len_and_kv_block_size(monkeypatch, param, bad):
+    def _never(*args, **kwargs):
+        raise AssertionError("model/backend build must not be reached")
+
+    # Validation runs after build_model_config / apply_nextn and before get_model.
+    monkeypatch.setattr(memory, "get_model", _never)
+    monkeypatch.setattr(memory, "get_backend", _never)
+    monkeypatch.setattr(memory.perf_database, "get_database", _never)
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        memory.KVCacheEstimator.from_request(
+            "Qwen/Qwen3-32B",
+            "h200_sxm",
+            "vllm",
+            max_num_tokens=8192,
+            max_batch_size=256,
+            **{param: bad},
+        )
+
+
+def test_calc_vllm_swa_batch_cap_rejects_nonpositive_max_model_len_or_block_size():
+    for max_model_len, block_size in ((0, 16), (-1, 16), (4096, 0), (4096, -8)):
+        with pytest.raises(ValueError, match="max_model_len and block_size must be positive"):
+            models.calc_vllm_swa_batch_cap(128, 8192, max_model_len, 100.0, 100.0, block_size, 1e9)
+
+
 def test_estimate_kv_cache_never_falls_back_after_a_context_parallel_capability_rejection(monkeypatch):
     # get_model rejects dcp/cp>1 for families without the sharded path with
     # NotImplementedError; the naive estimator knows neither knob, so falling
@@ -1094,7 +1198,7 @@ def test_estimate_kv_cache_propagates_when_fallback_disabled(monkeypatch):
 def test_estimate_kv_cache_keeps_version_slot_rejection_unwrapped(monkeypatch):
     # A backend version outside the queryable slots is a configuration error
     # with its own fix; it must not be re-labelled as an unsupported model.
-    from aisim_core.sdk import perf_database
+    import aisim_core.sdk.perf_database as perf_database
 
     slot_error = perf_database.UnlistedQueryVersionError("sglang version '0.5.10' is not a queryable version")
 
@@ -1411,6 +1515,344 @@ def test_tolerance_zero_is_noop_margin(monkeypatch):
     adj = out["tolerance_adjusted"]
     assert adj is not None
     assert adj["total_kv_size_bytes"] == out["total_kv_size_bytes"]
+
+
+# --------------------------------------------------------------------------- #
+# context_length -> max_model_len plumbing
+# --------------------------------------------------------------------------- #
+
+
+def test_context_length_forwarded_as_max_model_len(monkeypatch):
+    """estimate_kv_cache forwards context_length to from_request as max_model_len."""
+    received = {}
+
+    def _spy(*args, **kwargs):
+        received.update(kwargs)
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(memory.KVCacheEstimator, "from_request", classmethod(_spy))
+    with pytest.raises(ValueError, match="unsupported model/backend/GPU"):
+        memory.estimate_kv_cache(
+            "Qwen/Qwen3-32B",
+            "h200_sxm",
+            "trtllm",
+            max_num_tokens=8192,
+            max_batch_size=256,
+            memory_fraction_kind="of_free",
+            memory_fraction_value=0.9,
+            context_length=4096,
+            allow_naive_fallback=False,
+        )
+    assert received["max_model_len"] == 4096
+
+
+def test_materialize_aic_num_gpu_blocks_forwards_context_length_and_block_size(monkeypatch):
+    """Non-FPM materialization must pass max_model_len and block_size into capacity."""
+    from aisim import capacity
+
+    received = {}
+
+    def _spy(**kwargs):
+        received.update(kwargs)
+        return 42
+
+    monkeypatch.setattr(capacity, "estimate_num_gpu_blocks", _spy)
+    out = capacity.materialize_aic_num_gpu_blocks(
+        {
+            "aic_backend": "vllm",
+            "aic_model_path": "openai/gpt-oss-120b",
+            "aic_system": "h200_sxm",
+            "aic_tp_size": 1,
+            "max_model_len": 8192,
+            "block_size": 64,
+            "max_num_batched_tokens": 4096,
+            "max_num_seqs": 256,
+            "gpu_memory_utilization": 0.9,
+        }
+    )
+    assert out["num_gpu_blocks"] == 42
+    assert received["context_length"] == 8192
+    assert received["block_size"] == 64
+
+
+def test_capacity_estimate_num_gpu_blocks_forwards_block_size_as_scheduler_block_size(monkeypatch):
+    from aisim import capacity
+
+    received = {}
+
+    def _spy(*args, **kwargs):
+        received.update(kwargs)
+        return 7
+
+    # ``aisim.sdk.memory`` facade setattr writes through to the canonical
+    # ``aisim_core.sdk.memory`` package that capacity imports locally.
+    monkeypatch.setattr(memory, "estimate_num_gpu_blocks", _spy)
+    assert (
+        capacity.estimate_num_gpu_blocks(
+            backend_name="vllm",
+            system="h200_sxm",
+            model_path="openai/gpt-oss-120b",
+            tp_size=1,
+            block_size=64,
+            max_num_batched_tokens=4096,
+            max_num_sequences=256,
+            gpu_memory_utilization=0.9,
+            backend_version="0.19.0",
+            context_length=8192,
+        )
+        == 7
+    )
+    assert received["scheduler_block_size"] == 64
+    assert received["context_length"] == 8192
+
+
+def test_context_length_none_forwards_none(monkeypatch):
+    """When context_length is omitted, max_model_len defaults to None."""
+    received = {}
+
+    def _spy(*args, **kwargs):
+        received.update(kwargs)
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(memory.KVCacheEstimator, "from_request", classmethod(_spy))
+    with pytest.raises(ValueError, match="unsupported model/backend/GPU"):
+        memory.estimate_kv_cache(
+            "Qwen/Qwen3-32B",
+            "h200_sxm",
+            "trtllm",
+            max_num_tokens=8192,
+            max_batch_size=256,
+            memory_fraction_kind="of_free",
+            memory_fraction_value=0.9,
+            allow_naive_fallback=False,
+        )
+    assert received["max_model_len"] is None
+
+
+def test_non_swa_capacity_invariant_to_context_length(monkeypatch):
+    """For non-SWA models, capacity is identical with and without context_length.
+
+    Routes through ``estimate_kv_cache`` (the real entry point) so the
+    ``context_length`` parameter is forwarded as ``max_model_len`` to
+    ``from_request``. A synthetic breakdown with a linear
+    ``tokens_from_kv_bytes`` inverse (the default for standard GQA/MHA
+    models) verifies that the budget math is unaffected.
+    """
+    capacity, non_kv, kv_per_token = 141.0 * _GIB, 60.0 * _GIB, 327_680.0
+    bd = _breakdown(non_kv, kv_per_token, capacity)
+
+    monkeypatch.setattr(
+        memory.KVCacheEstimator,
+        "from_request",
+        classmethod(lambda cls, *a, **k: cls(bd)),
+    )
+
+    common = dict(
+        system="h200_sxm",
+        backend="trtllm",
+        max_num_tokens=8192,
+        max_batch_size=256,
+        memory_fraction_kind="of_free",
+        memory_fraction_value=0.9,
+    )
+    without = memory.estimate_kv_cache("Qwen/Qwen3-32B", **common)
+    with_ctx = memory.estimate_kv_cache("Qwen/Qwen3-32B", context_length=4096, **common)
+
+    assert without["total_kv_size_tokens"] == with_ctx["total_kv_size_tokens"]
+    assert without["total_kv_size_bytes"] == with_ctx["total_kv_size_bytes"]
+
+
+def test_calc_vllm_swa_batch_cap_aligns_max_model_len_before_spreading_reservation():
+    """Spread SWA reservation over ceil(max_model_len / block_size) * block_size.
+
+    Unaligned context lengths must differ from dividing by the raw length; already
+    block-aligned contexts must keep the pre-alignment numerical result.
+    """
+    window_size = 128
+    max_batched = 100  # window-1+max_batched stays below the context lengths below
+    block_size = 16
+    global_per_token = 100.0
+    swa_per_token = 100.0
+    budget = 1_000_000_000.0
+    swa_seq_tokens = window_size - 1 + max_batched
+    swa_reservation = (math.ceil(swa_seq_tokens / block_size) + 1) * block_size
+
+    aligned_len = 1024
+    assert aligned_len % block_size == 0
+    assert swa_seq_tokens < aligned_len
+    aligned = models.calc_vllm_swa_batch_cap(
+        window_size,
+        max_batched,
+        aligned_len,
+        global_per_token,
+        swa_per_token,
+        block_size,
+        budget,
+    )
+    assert aligned == int(budget / (global_per_token + swa_per_token * swa_reservation / aligned_len))
+
+    unaligned_len = 1000
+    assert unaligned_len % block_size != 0
+    assert swa_seq_tokens < unaligned_len
+    aligned_up = math.ceil(unaligned_len / block_size) * block_size
+    got = models.calc_vllm_swa_batch_cap(
+        window_size,
+        max_batched,
+        unaligned_len,
+        global_per_token,
+        swa_per_token,
+        block_size,
+        budget,
+    )
+    assert got == int(budget / (global_per_token + swa_per_token * swa_reservation / aligned_up))
+    raw_denominator = int(budget / (global_per_token + swa_per_token * swa_reservation / unaligned_len))
+    assert got != raw_denominator
+
+
+def _stub_vllm_swa_native_build(monkeypatch):
+    """Build real hybrid models; stub only backend memory and the perf DB."""
+    built = {}
+    real_get_model = memory.get_model
+
+    def _capture_get_model(*args, **kwargs):
+        model = real_get_model(*args, **kwargs)
+        built["model"] = model
+        return model
+
+    class _StubBackend:
+        def _get_memory_usage(self, *a, **k):
+            return {"weights": 10.0, "activations": 1.0, "others": 1.0, "nccl": 1.0, "kvcache": 0.0}
+
+    class _StubDB:
+        def __init__(self):
+            self.version = "0.19.0"
+            self.system_spec = {"gpu": {"mem_capacity": 100 * _GIB}}
+
+    monkeypatch.setattr(memory, "get_model", _capture_get_model)
+    monkeypatch.setattr(memory, "get_backend", lambda backend: _StubBackend())
+    monkeypatch.setattr(memory.perf_database, "get_database", lambda *a, **k: _StubDB())
+    return built
+
+
+def test_estimate_kv_cache_rejects_vllm_swa_dcp_greater_than_one(monkeypatch):
+    """Native gpt-oss SWA with context_length must reject dcp_size>1 hard."""
+    _stub_vllm_swa_native_build(monkeypatch)
+    with pytest.raises(ValueError, match="context parallelism is not supported"):
+        memory.estimate_kv_cache(
+            "openai/gpt-oss-120b",
+            "h200_sxm",
+            "vllm",
+            max_num_tokens=8192,
+            max_batch_size=256,
+            memory_fraction_kind="of_total",
+            memory_fraction_value=1.0,
+            context_length=4096,
+            # 8 KV heads: tp=16 gives replication 2, so dcp=2 is constructible.
+            tp_size=16,
+            moe_tp_size=16,
+            moe_ep_size=1,
+            dcp_size=2,
+            allow_naive_fallback=True,
+        )
+
+
+def test_vllm_swa_capacity_uses_context_length_through_native_build(monkeypatch):
+    """Native vLLM SWA capacity must honor deployment context_length.
+
+    Builds a real gpt-oss hybrid model through ``from_request`` (only the
+    backend memory/DB are stubbed) and checks token capacity against an
+    independent ``calc_vllm_swa_batch_cap`` evaluation that uses the same
+    ``context_length``. A second context length and the no-context fallback
+    must disagree, so ignoring ``max_model_len`` in the SWA path fails the test.
+    """
+    built = _stub_vllm_swa_native_build(monkeypatch)
+
+    common = dict(
+        model_path="openai/gpt-oss-120b",
+        system="h200_sxm",
+        backend="vllm",
+        max_num_tokens=8192,
+        max_batch_size=256,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=1.0,
+    )
+    context_length = 4096
+    out = memory.estimate_kv_cache(**common, context_length=context_length)
+
+    model = built["model"]
+    assert model.config.max_model_len == context_length
+    assert getattr(model, "_backend_name", None) == "vllm"
+
+    bytes_per_elem = model.config.kvcache_quant_mode.value.memory
+    num_kv_heads_per_gpu = (model._num_kv_heads + model.config.tp_size - 1) // model.config.tp_size
+    per_layer = num_kv_heads_per_gpu * model._head_size * 2 * bytes_per_elem
+    num_swa = model._num_layers // model._GPTOSS_ATTN_SCALE_FACTOR
+    num_global = model._num_layers - num_swa
+    block_size = getattr(model.config, "kv_block_size", None) or 16
+    max_batched = getattr(model.config, "max_num_batched_tokens", None) or context_length
+    assert block_size == 16
+    assert max_batched == common["max_num_tokens"]
+
+    expected = models.calc_vllm_swa_batch_cap(
+        model._GPTOSS_WINDOW_SIZE,
+        max_batched,
+        context_length,
+        num_global * per_layer,
+        num_swa * per_layer,
+        block_size,
+        float(out["total_kv_size_bytes"]),
+    )
+    assert out["total_kv_size_tokens"] == expected
+    assert expected != model.get_kvcache_max_tokens(float(out["total_kv_size_bytes"]))
+
+    longer = memory.estimate_kv_cache(**common, context_length=context_length * 2)
+    assert longer["total_kv_size_bytes"] == out["total_kv_size_bytes"]
+    assert longer["total_kv_size_tokens"] != out["total_kv_size_tokens"]
+
+    without = memory.estimate_kv_cache(**common)
+    assert without["total_kv_size_bytes"] == out["total_kv_size_bytes"]
+    assert without["total_kv_size_tokens"] == model.get_kvcache_max_tokens(float(without["total_kv_size_bytes"]))
+    assert without["total_kv_size_tokens"] != out["total_kv_size_tokens"]
+
+    # Naive fallback enabled must not hide an unresolved helper: native SWA still
+    # runs for configured and unset context_length.
+    with_naive = memory.estimate_kv_cache(**common, context_length=context_length, allow_naive_fallback=True)
+    assert with_naive["source"] == "native"
+    assert with_naive["total_kv_size_tokens"] == out["total_kv_size_tokens"]
+    without_naive = memory.estimate_kv_cache(**common, allow_naive_fallback=True)
+    assert without_naive["source"] == "native"
+    assert without_naive["total_kv_size_tokens"] == without["total_kv_size_tokens"]
+
+    # Uncapped SWA reservation: window-1+max_batched < context_length, with a
+    # non-default block size. Expected tokens are computed from the SlidingWindowSpec
+    # formula directly (not via calc_vllm_swa_batch_cap / model helpers).
+    uncapped_ctx = 16384
+    block_size = 64
+    uncapped = memory.estimate_kv_cache(**common, context_length=uncapped_ctx, kv_block_size=block_size)
+    uncapped_model = built["model"]
+    assert uncapped_model.config.max_model_len == uncapped_ctx
+    assert uncapped_model.config.kv_block_size == block_size
+
+    bytes_per_elem = uncapped_model.config.kvcache_quant_mode.value.memory
+    num_kv_heads_per_gpu = (
+        uncapped_model._num_kv_heads + uncapped_model.config.tp_size - 1
+    ) // uncapped_model.config.tp_size
+    per_layer = num_kv_heads_per_gpu * uncapped_model._head_size * 2 * bytes_per_elem
+    num_swa = uncapped_model._num_layers // uncapped_model._GPTOSS_ATTN_SCALE_FACTOR
+    num_global = uncapped_model._num_layers - num_swa
+    max_batched = uncapped_model.config.max_num_batched_tokens
+    assert max_batched == common["max_num_tokens"]
+
+    window = uncapped_model._GPTOSS_WINDOW_SIZE
+    swa_seq_tokens = min(window - 1 + max_batched, uncapped_ctx)
+    assert swa_seq_tokens == window - 1 + max_batched  # uncapped by max_model_len
+    swa_reservation = (math.ceil(swa_seq_tokens / block_size) + 1) * block_size
+    aligned_ctx = math.ceil(uncapped_ctx / block_size) * block_size
+    assert aligned_ctx == uncapped_ctx  # regression: aligned contexts stay unchanged
+    effective_per_token = num_global * per_layer + num_swa * per_layer * swa_reservation / aligned_ctx
+    expected_uncapped = int(float(uncapped["total_kv_size_bytes"]) / effective_per_token)
+    assert uncapped["total_kv_size_tokens"] == expected_uncapped
+    assert uncapped["total_kv_size_tokens"] != out["total_kv_size_tokens"]
 
 
 def test_breakdown_charges_a_colocated_encoder_and_reserved_bytes(monkeypatch):

@@ -2561,8 +2561,11 @@ fn aic_capacity_kwargs<'py>(
     kwargs.set_item("scheduler_block_size", role.rank.block_size)?;
     kwargs.set_item("max_num_tokens", role.rank.max_num_batched_tokens)?;
     kwargs.set_item("max_batch_size", role.rank.max_num_seqs)?;
+    // Analytical vLLM SWA capacity needs max_model_len too: rematerialization
+    // with num_gpu_blocks_is_explicit=false re-enters estimate_num_gpu_blocks and
+    // must not drop the context bound that Python preflight already applied.
+    kwargs.set_item("context_length", role.rank.max_model_len)?;
     if config.fpm_profile.is_some() {
-        kwargs.set_item("context_length", role.rank.max_model_len)?;
         kwargs.set_item(
             "worker_type",
             match config
@@ -8153,6 +8156,161 @@ mod tests {
         .unwrap();
 
         assert_eq!(role.rank.num_gpu_blocks, 321);
+    }
+
+    #[test]
+    fn analytical_capacity_rematerialization_forwards_context_length() {
+        // Without an FPM profile, automatic rematerialization still must pass
+        // rank.max_model_len so vLLM SWA reservation does not fall back to the
+        // idealized inverse and overwrite the Python preflight block count.
+        pyo3::prepare_freethreaded_python();
+        let mut role = aggregated_role(&ReplayEngineConfig::default());
+        role.rank.max_model_len = Some(8192);
+        let config = aic_config();
+        assert!(config.fpm_profile.is_none());
+
+        Python::with_gil(|py| {
+            let kwargs = aic_capacity_kwargs(py, &config, &role).unwrap();
+            assert_eq!(
+                kwargs
+                    .get_item("context_length")
+                    .unwrap()
+                    .expect("analytical rematerialization must forward context_length")
+                    .extract::<usize>()
+                    .unwrap(),
+                8192
+            );
+            assert!(
+                !kwargs.contains("worker_type").unwrap(),
+                "worker_type remains FPM-only"
+            );
+        });
+
+        materialize_aic_capacity(&config, &mut role, false, |_config, rank| {
+            assert_eq!(rank.rank.max_model_len, Some(8192));
+            Ok(321)
+        })
+        .unwrap();
+        assert_eq!(role.rank.num_gpu_blocks, 321);
+
+        role.rank.max_model_len = None;
+        Python::with_gil(|py| {
+            let kwargs = aic_capacity_kwargs(py, &config, &role).unwrap();
+            assert!(
+                kwargs
+                    .get_item("context_length")
+                    .unwrap()
+                    .expect("context_length key must be present")
+                    .is_none()
+            );
+        });
+    }
+
+    fn stub_swa_capacity_backend_and_database(py: Python<'_>) -> PyResult<()> {
+        // Isolate the Python capacity consumer: real gpt-oss SWA model build,
+        // stubbed backend memory + perf DB (same seam as the Python unit test).
+        let code = std::ffi::CString::new(
+            r#"
+import aisim_core.sdk.memory as memory
+
+class _StubBackend:
+    def _get_memory_usage(self, *a, **k):
+        return {"weights": 10.0, "activations": 1.0, "others": 1.0, "nccl": 1.0, "kvcache": 0.0}
+
+class _StubDB:
+    def __init__(self):
+        self.version = "0.19.0"
+        self.system_spec = {"gpu": {"mem_capacity": 100 * (1 << 30)}}
+
+memory.get_backend = lambda backend: _StubBackend()
+memory.perf_database.get_database = lambda *a, **k: _StubDB()
+"#,
+        )
+        .expect("stub source is valid UTF-8");
+        PyModule::from_code(
+            py,
+            code.as_c_str(),
+            c"swa_dcp_capacity_stub.py",
+            c"swa_dcp_capacity_stub",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn analytical_swa_rematerialization_rejects_dcp_greater_than_one() {
+        // Rematerialization forwards context_length and dcp_size into
+        // estimate_aic_num_gpu_blocks. With a real vLLM hybrid SWA model and
+        // max_model_len set, Python's SlidingWindowSpec path rejects dcp>1;
+        // dcp==1 returns a positive block count through the same bridge.
+        pyo3::prepare_freethreaded_python();
+        if let Err(error) = Python::with_gil(|py| py.import("aisim_core.sdk.memory").map(|_| ())) {
+            assert!(
+                std::env::var_os("AIC_REQUIRE_EMBEDDED_ROUND_TRIP").is_none(),
+                "analytical_swa_rematerialization_rejects_dcp_greater_than_one: \
+                 AIC_REQUIRE_EMBEDDED_ROUND_TRIP is set but \
+                 `aisim_core.sdk.memory` is not importable: {error}. \
+                 Install the Python SDK and set PYTHONPATH for the embedded interpreter."
+            );
+            eprintln!(
+                "analytical_swa_rematerialization_rejects_dcp_greater_than_one: SKIP — \
+                 `aisim_core.sdk.memory` is not importable: {error}. \
+                 Set AIC_REQUIRE_EMBEDDED_ROUND_TRIP=1 + PYTHONPATH to enforce."
+            );
+            return;
+        }
+        Python::with_gil(|py| stub_swa_capacity_backend_and_database(py).unwrap());
+
+        // 8 KV heads: tp=16 gives replication 2, so dcp=2 is constructible.
+        let mut role = aggregated_role(&ReplayEngineConfig::default());
+        role.rank.max_model_len = Some(8192);
+        role.tensor_parallel_size = 16;
+        let mut config = aic_config();
+        config.model = "openai/gpt-oss-120b".into();
+        config.system = "h200_sxm".into();
+        config.backend = "vllm".into();
+        config.tp = 16;
+        config.moe_tp_size = Some(16);
+        config.moe_ep_size = Some(1);
+        config.dcp = Some(2);
+        config.gpu_memory_utilization = Some(1.0);
+        assert!(config.fpm_profile.is_none());
+
+        Python::with_gil(|py| {
+            let kwargs = aic_capacity_kwargs(py, &config, &role).unwrap();
+            assert_eq!(
+                kwargs
+                    .get_item("context_length")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap(),
+                8192
+            );
+            assert_eq!(
+                kwargs
+                    .get_item("dcp_size")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<u32>()
+                    .unwrap(),
+                2
+            );
+        });
+
+        let err = materialize_aic_capacity(&config, &mut role, false, estimate_aic_num_gpu_blocks)
+            .expect_err("dcp>1 with max_model_len must fail rematerialization");
+        let message = err.to_string();
+        assert!(
+            message.contains("SlidingWindowSpec") || message.contains("context parallelism"),
+            "{message}"
+        );
+
+        config.dcp = Some(1);
+        materialize_aic_capacity(&config, &mut role, false, estimate_aic_num_gpu_blocks).unwrap();
+        assert!(
+            role.rank.num_gpu_blocks > 0,
+            "dcp==1 must keep automatic Python capacity sizing"
+        );
     }
 
     #[test]

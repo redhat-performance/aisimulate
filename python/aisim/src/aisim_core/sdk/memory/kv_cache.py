@@ -162,6 +162,14 @@ def _validate_cuda_graph_reservation(cuda_graph_reserved_bytes: int) -> None:
         )
 
 
+def _validate_max_model_len(value: int | None, *, param_name: str = "max_model_len") -> None:
+    """Validate an optional positive-integer context bound (``max_model_len`` / ``context_length``)."""
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{param_name} must be a positive integer, got {value!r}")
+
+
 # --------------------------------------------------------------------------- #
 # Shared scalar budget math.
 #
@@ -305,6 +313,8 @@ class KVCacheEstimator:
         wideep_num_slots: int | None = None,
         nextn: int = 0,
         systems_path: str | None = None,
+        max_model_len: int | None = None,
+        kv_block_size: int | None = None,
         colocated_encoder: bool = False,
         reserved_bytes: int = 0,
         encoder_parallel: str | None = None,
@@ -377,6 +387,19 @@ class KVCacheEstimator:
         # Memory is cost-side only; accepted-token progress never enters
         # capacity math.
         apply_nextn(model_config, nextn)
+        _validate_max_model_len(max_model_len)
+        if max_model_len is not None:
+            model_config.max_model_len = max_model_len
+        # Expose per-iteration token budget (max_num_tokens is the caller's
+        # max_num_batched_tokens) so the vLLM SWA block reservation can cap
+        # (window - 1 + batched_tokens) at max_model_len.
+        max_num_batched_tokens = int(max_num_tokens)
+        if max_num_batched_tokens > 0:
+            model_config.max_num_batched_tokens = max_num_batched_tokens
+        if kv_block_size is not None:
+            if isinstance(kv_block_size, bool) or not isinstance(kv_block_size, int) or kv_block_size <= 0:
+                raise ValueError(f"kv_block_size must be a positive integer, got {kv_block_size!r}")
+            model_config.kv_block_size = kv_block_size
         # Capacity needs model/system metadata, including when external FPM
         # timing has no backend data directory.
         database = perf_database.get_database(
@@ -1123,6 +1146,7 @@ def estimate_kv_cache(
     worker_type: str = "aggregated",
     context_length: int | None = None,
     request_occupancy_tokens: int | None = None,
+    kv_block_size: int | None = None,
     colocated_encoder: bool = False,
     reserved_bytes: int = 0,
     encoder_parallel: str | None = None,
@@ -1203,6 +1227,8 @@ def estimate_kv_cache(
     _validate_tolerance(tolerance_fraction)
     _validate_naive_reservation(naive_kv_reservation)
     _validate_cuda_graph_reservation(cuda_graph_reserved_bytes)
+    _validate_max_model_len(context_length, param_name="context_length")
+    _validate_max_model_len(kv_block_size, param_name="kv_block_size")
     _validate_encoder_parallel(encoder_parallel)
     _validate_reserved_bytes(reserved_bytes)
     # Before the model build and the naive fallback, which would swallow the error.
@@ -1369,6 +1395,8 @@ def estimate_kv_cache(
             wideep_num_slots=wideep_num_slots,
             nextn=int(nextn),
             systems_path=systems_path,
+            max_model_len=context_length,
+            kv_block_size=kv_block_size,
             colocated_encoder=colocated_encoder,
             reserved_bytes=reserved_bytes,
             encoder_parallel=encoder_parallel,
@@ -1415,13 +1443,23 @@ def estimate_kv_cache(
         )
     else:
         # Native model built: budget-math failures (no KV budget, zero per-token)
-        # propagate; they do NOT trigger the naive fallback.
-        estimate = native.estimate(
-            is_of_free=is_of_free,
-            fraction=fraction,
-            gpu_memory_capacity_bytes_override=gpu_memory_capacity_bytes_override,
-            cuda_graph_reserved_bytes=cuda_graph_reserved_bytes,
-        )
+        # propagate; they do NOT trigger the naive fallback. A SlidingWindowSpec
+        # DCP rejection can also arise here (model construction may succeed) and
+        # must stay a hard error, not a silent idealized inverse.
+        try:
+            estimate = native.estimate(
+                is_of_free=is_of_free,
+                fraction=fraction,
+                gpu_memory_capacity_bytes_override=gpu_memory_capacity_bytes_override,
+                cuda_graph_reserved_bytes=cuda_graph_reserved_bytes,
+            )
+        except NotImplementedError as exc:
+            if int(cp_size) > 1 or int(dcp_size) > 1:
+                raise ValueError(
+                    f"context parallelism is not supported for KV-cache estimation of this model/backend "
+                    f"(model={model_path}, backend={backend}, cp_size={cp_size}, dcp_size={dcp_size}): {exc}"
+                ) from exc
+            raise
 
     # Apply the tolerance margin (no-op when `tolerance_fraction` is None),
     # identically for the native and naive estimates. _apply_tolerance reads the
@@ -1544,6 +1582,7 @@ def estimate_num_gpu_blocks(
         fpm_profile=fpm_profile,
         worker_type=worker_type,
         context_length=context_length,
+        kv_block_size=int(scheduler_block_size),
         colocated_encoder=colocated_encoder,
         reserved_bytes=reserved_bytes,
         encoder_parallel=encoder_parallel,

@@ -102,7 +102,7 @@ class TestStep3p7ConfigParse:
 
 class TestStep3p7KVCache:
     @staticmethod
-    def _make_model(tp_size=1):
+    def _make_model(tp_size=1, backend_name="trtllm"):
         result = _parse_hf_config_json(_step37_hf_config())
         model_config = config.ModelConfig(
             tp_size=tp_size,
@@ -131,11 +131,40 @@ class TestStep3p7KVCache:
             result["vocab"],
             result["context"],
             model_config,
-            backend_name="trtllm",
+            backend_name=backend_name,
         )
         model._share_expert_dim = 1280
         model.set_hybrid_config(result["extra_params"])
         return model
+
+    def test_vllm_swa_batch_capacity_dispatch_and_fallbacks(self):
+        """vLLM + max_model_len uses SlidingWindowSpec; unset / non-vLLM keep the inverse."""
+        from aisim_core.sdk.models.helpers import calc_vllm_swa_batch_cap
+
+        budget = 20 * (1 << 30)
+        model = self._make_model(backend_name="vllm")
+        model.config.max_model_len = 8192
+        model.config.max_num_batched_tokens = 4096
+        model.config.kv_block_size = 16
+        num_swa, num_global = model._swa_global_counts()
+        per = model._kv_per_layer_per_token()
+        expected = calc_vllm_swa_batch_cap(
+            model._hybrid_config.sliding_window_size,
+            4096,
+            8192,
+            num_global * per,
+            num_swa * per,
+            16,
+            budget,
+        )
+        assert model.get_kvcache_batch_capacity(budget, 256) == min(expected, model.get_kvcache_max_tokens(budget))
+
+        unset = self._make_model(backend_name="vllm")
+        assert unset.get_kvcache_batch_capacity(budget, 256) == unset.get_kvcache_max_tokens(budget)
+
+        non_vllm = self._make_model(backend_name="trtllm")
+        non_vllm.config.max_model_len = 8192
+        assert non_vllm.get_kvcache_batch_capacity(budget, 256) == non_vllm.get_kvcache_max_tokens(budget)
 
     def test_swa_global_counts(self):
         model = self._make_model()

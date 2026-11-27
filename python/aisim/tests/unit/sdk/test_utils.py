@@ -997,7 +997,7 @@ class TestGemma4MixModelBuilder:
         )
 
     @staticmethod
-    def _make_model(model_config, layer_types=None, attention_k_eq_v=True):
+    def _make_model(model_config, layer_types=None, attention_k_eq_v=True, backend_name="trtllm"):
         """Build a Gemma4MixModel at the gemma-4-26B-A4B shape (or a custom layer pattern)."""
         if layer_types is None:
             layer_types = (["sliding_attention"] * 5 + ["full_attention"]) * 5
@@ -1027,10 +1027,44 @@ class TestGemma4MixModelBuilder:
             262144,  # context_length
             model_config,
             None,  # extra_params (we use set_gemma4_config instead)
-            backend_name="trtllm",
+            backend_name=backend_name,
         )
         model.set_gemma4_config(cfg)
         return model
+
+    def test_vllm_swa_batch_capacity_dispatch_and_fallbacks(self):
+        """vLLM + max_model_len uses SlidingWindowSpec; unset / non-vLLM keep the inverse."""
+        from aisim_core.sdk.models.helpers import calc_vllm_swa_batch_cap
+
+        budget = 20 * (1 << 30)
+        model = self._make_model(self._make_model_config(), backend_name="vllm")
+        model.config.max_model_len = 8192
+        model.config.max_num_batched_tokens = 4096
+        model.config.kv_block_size = 16
+        cfg = model._gemma4_config
+        bytes_per_elem = model.config.kvcache_quant_mode.value.memory
+        tp = model.config.tp_size
+        swa_kv = (cfg.swa_num_kv_heads + tp - 1) // tp
+        global_kv = (cfg.global_num_kv_heads + tp - 1) // tp
+        num_swa = cfg.layer_types.count("sliding_attention")
+        num_global = cfg.layer_types.count("full_attention")
+        expected = calc_vllm_swa_batch_cap(
+            cfg.sliding_window_size,
+            4096,
+            8192,
+            num_global * global_kv * cfg.global_head_dim * 2 * bytes_per_elem,
+            num_swa * swa_kv * cfg.swa_head_dim * 2 * bytes_per_elem,
+            16,
+            budget,
+        )
+        assert model.get_kvcache_batch_capacity(budget, 256) == min(expected, model.get_kvcache_max_tokens(budget))
+
+        unset = self._make_model(self._make_model_config(), backend_name="vllm")
+        assert unset.get_kvcache_batch_capacity(budget, 256) == unset.get_kvcache_max_tokens(budget)
+
+        non_vllm = self._make_model(self._make_model_config(), backend_name="trtllm")
+        non_vllm.config.max_model_len = 8192
+        assert non_vllm.get_kvcache_batch_capacity(budget, 256) == non_vllm.get_kvcache_max_tokens(budget)
 
     @staticmethod
     def _make_dense_model():

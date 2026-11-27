@@ -328,6 +328,11 @@ fn estimate_kwargs<'py>(
     kwargs.set_item("moe_tp_size", parallel.moe_tp_size)?;
     kwargs.set_item("moe_ep_size", parallel.moe_ep_size)?;
     kwargs.set_item("cp_size", parallel.cp_size.unwrap_or(1))?;
+    // Optional scheduler block size for Python SWA reservation math. There is
+    // no context_length / max_model_len on this request today, so hybrid SWA
+    // vLLM capacity still falls back to the idealized inverse unless callers
+    // use the Python estimate_kv_cache / capacity materialization path.
+    kwargs.set_item("kv_block_size", engine.kv_block_size)?;
     kwargs.set_item(
         "fpm_profile",
         engine.extra.get("fpm_profile").map(String::as_str),
@@ -658,6 +663,7 @@ mod tests {
 
         pyo3::Python::initialize();
         let mut req = python_forwarding_request();
+        req.engine.kv_block_size = Some(64);
         req.engine.extra.insert(
             "fpm_profile".into(),
             serde_json::json!({"model": "test-model"}).to_string(),
@@ -670,6 +676,13 @@ mod tests {
                     .unwrap()
                     .extract::<String>()?,
                 r#"{"model":"test-model"}"#
+            );
+            assert_eq!(
+                kwargs
+                    .get_item("kv_block_size")?
+                    .expect("kv_block_size kwarg must be present")
+                    .extract::<u32>()?,
+                64
             );
             assert_eq!(
                 kwargs
