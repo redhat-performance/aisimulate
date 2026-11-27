@@ -1,0 +1,21 @@
+{#
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-#}
+{#
+Kustomize name-reference configuration for the llm-d v1.0+ `DisaggregatedSet`.
+
+Kustomize ships reference mappings for built-in kinds only, so `namePrefix`
+renames the guide's ServiceAccount without rewriting
+`spec.roles[].spec.leaderWorkerTemplate.workerTemplate.spec.serviceAccountName`.
+The list path without indices applies to every role, as the guide's own
+`labels` entries demonstrate. Loaded by the overlay's `configurations:`.
+#}
+nameReference:
+  - kind: ServiceAccount
+    version: v1
+    fieldSpecs:
+      - path: spec/roles/spec/leaderWorkerTemplate/workerTemplate/spec/serviceAccountName
+        kind: DisaggregatedSet
+        group: disaggregatedset.x-k8s.io
+        version: v1

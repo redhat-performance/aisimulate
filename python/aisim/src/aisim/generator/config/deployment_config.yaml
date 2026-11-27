@@ -350,6 +350,14 @@ inputs:
   - key: LlmdConfig.kustomize_base_path
     required: false
     default: ""
+  - key: LlmdConfig.kustomize_layout
+    required: false
+    # Defaults are Jinja-evaluated: the inner quotes make this the string
+    # "deployment" rather than an undefined bare identifier (config_schema rule).
+    default: '"deployment"'
+  - key: LlmdConfig.kustomize_disaggregatedset_name
+    required: false
+    default: ""
   - key: LlmdConfig.kustomize_name_prefix
     required: false
     default: ""

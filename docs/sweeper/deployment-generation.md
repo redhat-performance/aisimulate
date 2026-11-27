@@ -332,7 +332,8 @@ image settings belong to generator overrides.
 | Target | Artifacts and scope |
 |---|---|
 | `dynamo-j2`, `dynamo-python` | Dynamo worker launch scripts, backend flags/configuration and deployment resources |
-| `llm-d-helm`, `llm-d-kustomize` | llm-d deployment configuration with explicitly selected runtime images |
+| `llm-d-helm` | llm-d ModelService Helm values with explicitly selected runtime images |
+| `llm-d-kustomize` | llm-d kustomize overlay: router and prerequisites are separate; the overlay patches one model-server base (see below) |
 | `fpm` | Reusable vLLM resource workload, `fpm_env.sh` and `run.sh` |
 | `slurm` | Single-node Dynamo service/benchmark bundle for Slurm with Pyxis/Enroot |
 
@@ -341,6 +342,64 @@ identity, scheduler limits and supported adapter state. It rejects unknown
 adapter mappings and GPU-count mismatches. Canonical result views remain
 unchanged by artifact rendering. Compatibility CLI generation flags are in
 [the AIC CLI reference](../aic-backward-compatibility/cli.md#deployment-target-selection).
+
+## llm-d kustomize layouts
+
+The `llm-d-kustomize` target emits a thin overlay: a `kustomization.yaml` that
+names a model-server base inside an llm-d checkout, plus the role patches. Set
+`LlmdConfig.kustomize_base_path` when the base is not the default for the
+selected layout. The path is resolved by Kustomize relative to the overlay, and
+Kustomize rejects absolute paths and paths outside its root, so the overlay has
+to be applied from inside the checkout.
+
+`LlmdConfig.kustomize_layout` selects which base shape the patches address:
+
+| Layout | Base shape | llm-d direction |
+|---|---|---|
+| `deployment` (default) | prefill and decode are two `Deployment` objects | guides before v1.0 |
+| `disaggregatedset` | both roles are entries in one `DisaggregatedSet` (`disaggregatedset.x-k8s.io/v1`) | v1.0 and later P/D guides |
+
+`deployment` also selects an XPU base when `LlmdConfig.accelerator_type` is
+XPU. `disaggregatedset` follows the same rule: it defaults
+`LlmdConfig.kustomize_base_path` to the GPU vLLM P/D guide base, or to
+`guides/pd-disaggregation/modelserver/xpu/vllm` (and its `rdma` overlay when
+`LlmdConfig.xpu_rdma_enabled` is set) for XPU. Set the path explicitly for any
+other base.
+
+`disaggregatedset` applies to disaggregated mode only; aggregated mode has no
+P/D split and renders the `Deployment` overlay. The two layouts are not
+interchangeable: patching a `DisaggregatedSet` with a strategic-merge patch
+would replace `spec.roles` wholesale, because a CRD list has no merge key. The
+`disaggregatedset` patches are therefore JSON 6902 documents with an explicit
+`target`, and each starts with a `test` op on the role name so a reordered base
+fails the build instead of patching the wrong role.
+
+The overlay also emits `name-reference.yaml` and loads it through
+`configurations:`. Kustomize has no built-in name reference for a
+`DisaggregatedSet`, so without it a `namePrefix` would rename the
+ServiceAccount while both role pod templates kept the unprefixed name.
+
+`LlmdConfig.kustomize_disaggregatedset_name` names the resource the patches
+address. It defaults to the guide's own name for the selected accelerator
+(`pd-disagg-vllm`, or `pd-disagg-xpu` for XPU); an explicit value always wins.
+Each role requests the worker GPU count the vLLM rule resolves (TP × PP × DP,
+times prefill CP because `-pcp` expands the world size; decode CP adds none),
+and the GPU entries are patched in place so the base's CPU and memory requests
+and limits are preserved. On XPU the accelerator
+comes from a `ResourceClaimTemplate` instead, so each role's claim requests the
+same count; the RDMA guide's separate `nic`
+request is left unchanged. Neither layout pins an llm-d revision or an image:
+pass `LlmdConfig.vllm_image` with an immutable tag or digest, and record the
+llm-d revision you applied the overlay to.
+
+A patch whose `target` matches no resource is skipped silently by
+`kustomize build`; it does not fail. When the base renames its
+`DisaggregatedSet` or changes the role order, the `test` op fails loudly, but a
+name that matches nothing leaves the base unpatched. An explicit
+`kustomize_disaggregatedset_name` therefore also emits a guard patch that
+matches the base `DisaggregatedSet` by kind and tests `/metadata/name`, so a
+name the base does not declare fails the build instead of shipping the base
+model. The resolved default names match their guides and need no guard.
 
 ## FPM resource workload
 

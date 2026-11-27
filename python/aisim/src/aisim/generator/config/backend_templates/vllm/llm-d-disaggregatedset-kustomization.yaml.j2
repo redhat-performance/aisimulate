@@ -1,0 +1,117 @@
+{#
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-#}
+{#
+Kustomize overlay for the llm-d v1.0+ P/D layout, where both roles live in one
+`DisaggregatedSet` (disaggregatedset.x-k8s.io/v1) instead of two Deployments.
+
+The role patches are JSON 6902 documents: Kustomize has no strategic-merge key
+for a CRD list, so a strategic merge would replace `spec.roles` wholesale. Each
+patch states its target explicitly and begins with a `test` op on the role name,
+so a base whose role order changes fails the build instead of patching the wrong
+role.
+
+Kustomize has no built-in name reference for a DisaggregatedSet, so a
+`namePrefix` renames the ServiceAccount without rewriting the pod templates
+that reference it. `configurations` loads the reference mapping that keeps both
+roles bound to the built account.
+#}
+{%- set llmd_config = LlmdConfig | default({}) -%}
+{%- set node_config = NodeConfig | default({}) -%}
+{%- set default_accelerator_type = 'xpu' if node_config.system_name | default('') == 'b60' else 'nvidia' -%}
+{%- set accelerator_type = llmd_config.accelerator_type | default(default_accelerator_type, true) -%}
+{%- set is_xpu = accelerator_type in ['xpu', 'intel'] -%}
+{%- set xpu_rdma_enabled = llmd_config.xpu_rdma_enabled | default(false) -%}
+{%- if is_xpu and xpu_rdma_enabled -%}
+{%- set default_base_path = 'guides/pd-disaggregation/modelserver/xpu/vllm/rdma' -%}
+{%- elif is_xpu -%}
+{%- set default_base_path = 'guides/pd-disaggregation/modelserver/xpu/vllm' -%}
+{%- else -%}
+{%- set default_base_path = 'guides/pd-disaggregation/modelserver/gpu/vllm/base' -%}
+{%- endif -%}
+{#- Each accelerator's guide names its DisaggregatedSet differently, so the
+    default follows the base and an explicit name always wins. -#}
+{%- set default_resource_name = 'pd-disagg-xpu' if is_xpu else 'pd-disagg-vllm' -%}
+{%- set explicit_resource_name = llmd_config.kustomize_disaggregatedset_name | default('', true) -%}
+{%- set resource_name = explicit_resource_name | default(default_resource_name, true) -%}
+{#- The claim count is the rule-derived per-worker GPU count, so it matches the
+    topology the role args encode. The products are only a fallback for callers
+    that render the template outside `render_backend_templates`; prefill CP
+    expands the world, decode CP does not. -#}
+{%- set prefill_claim_fallback = (prefill_tensor_parallel_size | default(1) | int) * (prefill_pipeline_parallel_size | default(1) | int) * (prefill_data_parallel_size | default(1) | int) * (prefill_context_parallel_size | default(1) | int) -%}
+{%- set decode_claim_fallback = (decode_tensor_parallel_size | default(1) | int) * (decode_pipeline_parallel_size | default(1) | int) * (decode_data_parallel_size | default(1) | int) -%}
+{%- set prefill_claim_count = prefill_gpu | default(prefill_claim_fallback, true) -%}
+{%- set decode_claim_count = decode_gpu | default(decode_claim_fallback, true) -%}
+{#- The XPU guides name the accelerator request `intel`, while the RDMA
+    override renames it `gpu` and adds a separate `nic` request after it. -#}
+{%- set xpu_request_name = 'gpu' if xpu_rdma_enabled else 'intel' -%}
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - {{ llmd_config.kustomize_base_path | default(default_base_path, true) }}
+
+configurations:
+  - name-reference.yaml
+
+{% if llmd_config.kustomize_name_prefix | default('', true) %}
+namePrefix: {{ llmd_config.kustomize_name_prefix }}
+
+{% endif %}
+patches:
+{% if explicit_resource_name %}
+  # kustomize skips a patch whose target matches nothing, without an error.
+  # With an explicit name, a mismatch would leave the base DisaggregatedSet
+  # unpatched and ship its model instead of the requested one. Matching by kind
+  # and testing `metadata.name` turns that silent skip into a build failure.
+  - target:
+      group: disaggregatedset.x-k8s.io
+      version: v1
+      kind: DisaggregatedSet
+    patch: |-
+      - op: test
+        path: /metadata/name
+        value: {{ resource_name }}
+{% endif %}
+  - path: patch-decode.yaml
+    target:
+      group: disaggregatedset.x-k8s.io
+      version: v1
+      kind: DisaggregatedSet
+      name: {{ resource_name }}
+  - path: patch-prefill.yaml
+    target:
+      group: disaggregatedset.x-k8s.io
+      version: v1
+      kind: DisaggregatedSet
+      name: {{ resource_name }}
+{% if is_xpu %}
+  # XPU requests devices through ResourceClaimTemplates, so the GPU ops in the
+  # role patches do not apply. Each role's claim asks for the rule-derived GPU
+  # count; the RDMA guide's `nic` request is left alone.
+  - target:
+      group: resource.k8s.io
+      version: v1
+      kind: ResourceClaimTemplate
+      name: xpu-decode-claim-xpu
+    patch: |-
+      - op: test
+        path: /spec/spec/devices/requests/0/name
+        value: {{ xpu_request_name }}
+      - op: replace
+        path: /spec/spec/devices/requests/0/exactly/count
+        value: {{ decode_claim_count }}
+  - target:
+      group: resource.k8s.io
+      version: v1
+      kind: ResourceClaimTemplate
+      name: xpu-prefill-claim-xpu
+    patch: |-
+      - op: test
+        path: /spec/spec/devices/requests/0/name
+        value: {{ xpu_request_name }}
+      - op: replace
+        path: /spec/spec/devices/requests/0/exactly/count
+        value: {{ prefill_claim_count }}
+{% endif %}

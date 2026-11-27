@@ -819,14 +819,50 @@ def render_backend_templates(
 
     # Render auxiliary templates based on deployment target
     if deployment_target == "llm-d-kustomize":
-        # llm-d v0.7+ modelserver deployment: render Kustomize overlay patches.
+        # llm-d modelserver deployment: render a Kustomize overlay.
+        #
+        # Two layouts exist. `deployment` (the default) matches guides whose
+        # P/D roles are two Deployments. `disaggregatedset` matches the
+        # llm-d v1.0+ layout, where both roles live in one DisaggregatedSet
+        # CRD; those patches must be JSON 6902, because a CRD list has no
+        # strategic-merge key. Aggregated mode always renders a Deployment:
+        # there is no P/D split to group.
         is_agg_mode = (context.get("DynConfig") or {}).get("mode", "disagg") == "agg"
-        kustomize_templates = [
-            ("llm-d-kustomization.yaml.j2", "kustomization.yaml"),
-            ("llm-d-patch-decode.yaml.j2", "patch-vllm.yaml" if is_agg_mode else "patch-decode.yaml"),
-        ]
-        if not is_agg_mode:
-            kustomize_templates.append(("llm-d-patch-prefill.yaml.j2", "patch-prefill.yaml"))
+        layout_setting = (context.get("LlmdConfig") or {}).get("kustomize_layout")
+        if layout_setting is None:
+            layout = "deployment"
+        elif not isinstance(layout_setting, str):
+            # A false or numeric value is a configuration error, not "unset":
+            # silently treating it as the default would deploy a different
+            # layout than the caller asked for.
+            raise ValueError(
+                f"LlmdConfig.kustomize_layout must be 'deployment' or 'disaggregatedset', got {layout_setting!r}"
+            )
+        else:
+            layout = layout_setting.strip().lower()
+        if layout not in {"deployment", "disaggregatedset"}:
+            raise ValueError(
+                f"unknown LlmdConfig.kustomize_layout {layout!r}; expected 'deployment' or 'disaggregatedset'"
+            )
+        if layout == "disaggregatedset" and not is_agg_mode:
+            kustomize_templates = [
+                ("llm-d-disaggregatedset-kustomization.yaml.j2", "kustomization.yaml"),
+                ("llm-d-disaggregatedset-name-reference.yaml.j2", "name-reference.yaml"),
+                ("llm-d-disaggregatedset-patch-decode.yaml.j2", "patch-decode.yaml"),
+                ("llm-d-disaggregatedset-patch-prefill.yaml.j2", "patch-prefill.yaml"),
+            ]
+        else:
+            if layout == "disaggregatedset":
+                logger.warning(
+                    "LlmdConfig.kustomize_layout='disaggregatedset' applies to disaggregated "
+                    "deployments; aggregated mode renders the Deployment overlay."
+                )
+            kustomize_templates = [
+                ("llm-d-kustomization.yaml.j2", "kustomization.yaml"),
+                ("llm-d-patch-decode.yaml.j2", "patch-vllm.yaml" if is_agg_mode else "patch-decode.yaml"),
+            ]
+            if not is_agg_mode:
+                kustomize_templates.append(("llm-d-patch-prefill.yaml.j2", "patch-prefill.yaml"))
         for template_name, artifact_name in kustomize_templates:
             if not (template_path / template_name).exists():
                 continue
