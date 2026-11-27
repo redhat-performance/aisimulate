@@ -19,7 +19,9 @@ checkable parity assertion for the port.
 
 from __future__ import annotations
 
+import json
 import math
+from importlib.resources import files
 from types import SimpleNamespace
 
 import pytest
@@ -33,8 +35,9 @@ pytestmark = pytest.mark.unit
 # extension (e.g. the FPM pyclass).
 pytest.importorskip("aisim_core")
 
-import aisim_core.sdk.memory as memory
-import aisim_core.sdk.models as models
+from aisim.sdk import memory
+from aisim_core.sdk.errors import InvalidEngineConfigurationError
+from aisim_core.sdk.models.helpers import _apply_model_quant_defaults, calc_vllm_swa_batch_cap
 
 _GIB = 1 << 30
 
@@ -236,7 +239,7 @@ def test_native_zero_per_token_raises():
 def test_native_capacity_discloses_resolved_kv_precision(monkeypatch, override, resolved, token_capacity):
     def get_model(_path, config, backend):
         # Exercise real default resolution for an FP8 checkpoint with no KV declaration.
-        models._apply_model_quant_defaults(config, {"quant_algo": "fp8"}, "Qwen3ForCausalLM", backend)
+        _apply_model_quant_defaults(config, {"quant_algo": "fp8"}, "Qwen3ForCausalLM", backend)
         # K and V, eight layers, two KV heads, head dimension 64.
         bytes_per_token = 2 * 8 * 2 * 64 * config.kvcache_quant_mode.value.memory
         return SimpleNamespace(
@@ -1136,7 +1139,7 @@ def test_from_request_rejects_invalid_max_model_len_and_kv_block_size(monkeypatc
 def test_calc_vllm_swa_batch_cap_rejects_nonpositive_max_model_len_or_block_size():
     for max_model_len, block_size in ((0, 16), (-1, 16), (4096, 0), (4096, -8)):
         with pytest.raises(ValueError, match="max_model_len and block_size must be positive"):
-            models.calc_vllm_swa_batch_cap(128, 8192, max_model_len, 100.0, 100.0, block_size, 1e9)
+            calc_vllm_swa_batch_cap(128, 8192, max_model_len, 100.0, 100.0, block_size, 1e9)
 
 
 def test_estimate_kv_cache_never_falls_back_after_a_context_parallel_capability_rejection(monkeypatch):
@@ -1174,6 +1177,367 @@ def test_estimate_kv_cache_never_falls_back_after_a_context_parallel_capability_
         allow_naive_fallback=True,
     )
     assert out["source"] == "naive_fallback"
+
+
+def test_estimate_kv_cache_never_falls_back_after_corrupt_checkpoint_metadata(monkeypatch):
+    # ``check_is_moe`` raises the typed error for Gemma 4 checkpoints that
+    # declare only one of num_experts/topk. The naive estimator parses the same
+    # HF config, so falling back would return a capacity for a checkpoint the
+    # native path just rejected (and the Rust bridge treats this type as
+    # non-fallback-safe).
+    def _corrupt(*args, **kwargs):
+        raise InvalidEngineConfigurationError(
+            "Gemma 4 checkpoint has inconsistent expert metadata: num_experts=128, topk=0"
+        )
+
+    monkeypatch.setattr(memory.KVCacheEstimator, "from_request", classmethod(_corrupt))
+    monkeypatch.setattr(memory.NaiveKVCacheEstimator, "_load_config", lambda *a, **k: dict(_RAW_UNSUPPORTED))
+    with pytest.raises(InvalidEngineConfigurationError, match="inconsistent expert metadata"):
+        memory.estimate_kv_cache(
+            "nvidia/Gemma-4-31B-IT-NVFP4",
+            "h200_sxm",
+            "vllm",
+            max_num_tokens=8192,
+            max_batch_size=256,
+            memory_fraction_kind="of_total",
+            memory_fraction_value=0.9,
+            gpu_memory_capacity_bytes_override=200 * _GIB,
+            allow_naive_fallback=True,
+        )
+
+
+def test_estimate_kv_cache_rejects_corrupt_gemma4_metadata_before_the_database(monkeypatch):
+    # The classifier gate must run before the perf-DB lookup. If it did not, a
+    # failing database plus allow_naive_fallback=True would let the naive
+    # estimator re-parse the same corrupt checkpoint and return a capacity.
+    from aisim_core.sdk import models, perf_database
+    from aisim_core.sdk.models import helpers as model_helpers
+
+    corrupt = dict(models._get_model_info("nvidia/Gemma-4-31B-IT-NVFP4"))
+    corrupt["num_experts"] = 128
+    corrupt["topk"] = 0
+    monkeypatch.setattr(model_helpers, "_get_model_info", lambda *args, **kwargs: corrupt)
+
+    def _unreachable(*args, **kwargs):
+        pytest.fail("corrupt checkpoint metadata must be rejected before the database lookup")
+
+    monkeypatch.setattr(perf_database, "get_database", _unreachable)
+    with pytest.raises(InvalidEngineConfigurationError, match="inconsistent expert metadata"):
+        memory.estimate_kv_cache(
+            "nvidia/Gemma-4-31B-IT-NVFP4",
+            "h200_sxm",
+            "vllm",
+            max_num_tokens=8192,
+            max_batch_size=256,
+            memory_fraction_kind="of_total",
+            memory_fraction_value=0.9,
+            gpu_memory_capacity_bytes_override=200 * _GIB,
+            allow_naive_fallback=True,
+        )
+
+
+@pytest.mark.parametrize("system", ["gb300", "unavailable_gemma4_type_regression"])
+@pytest.mark.parametrize("entry_point", ["kv_cache", "best_available"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("num_experts", "128"),
+        ("num_experts", 128.5),
+        ("num_experts", 128.0),
+        ("num_experts", True),
+        ("num_experts", False),
+        ("num_experts", 0.0),
+        ("top_k_experts", "8"),
+        ("top_k_experts", 8.5),
+        ("top_k_experts", 8.0),
+        ("top_k_experts", True),
+        ("top_k_experts", False),
+        ("top_k_experts", 0.0),
+    ],
+)
+def test_malformed_local_gemma4_expert_types_cannot_fall_back(tmp_path, field, value, entry_point, system):
+    # Exercise the real local-config parser, pre-database gate and Rust bridge.
+    # Neither an available database nor a missing system may hide corrupt types
+    # by returning naive capacity or selecting an unready regression estimator.
+    from aisim_core.sdk import RustForwardPassPerfModel
+
+    config_path = files("aisim_core").joinpath("model_configs/nvidia--Gemma-4-26B-A4B-NVFP4_config.json")
+    raw_config = json.loads(config_path.read_text())
+    raw_config["text_config"][field] = value
+    (tmp_path / "config.json").write_text(json.dumps(raw_config))
+
+    if entry_point == "kv_cache":
+        with pytest.raises(InvalidEngineConfigurationError, match="inconsistent expert metadata"):
+            memory.estimate_kv_cache(
+                str(tmp_path),
+                system,
+                "vllm",
+                max_num_tokens=8192,
+                max_batch_size=256,
+                memory_fraction_kind="of_total",
+                memory_fraction_value=0.9,
+                gpu_memory_capacity_bytes_override=400 * _GIB,
+                allow_naive_fallback=True,
+                allow_hf_config_download=False,
+            )
+    else:
+        with pytest.raises(ValueError, match="invalid engine config:.*inconsistent expert metadata"):
+            RustForwardPassPerfModel.best_available(
+                {
+                    "model": str(tmp_path),
+                    "system": system,
+                    "backend": "vllm",
+                    "worker_type": "aggregated",
+                    "estimation_mode": "auto",
+                    "fallback_policy": "allow",
+                }
+            )
+
+
+def test_estimate_kv_cache_does_not_naive_fallback_on_a_non_gemma_configuration_error():
+    # The re-raise is request-wide, not Gemma-specific: it lives in the generic
+    # native-build `except`. An invalid request must not be priced by the naive
+    # estimator, which would return a capacity for a topology the native path
+    # just rejected. Before this branch the same call below returned
+    # source="naive_fallback" with total_kv_size_tokens=1840487 on 0809faae9.
+    with pytest.raises(InvalidEngineConfigurationError, match="Parallelism width mismatch"):
+        memory.estimate_kv_cache(
+            "deepseek-ai/DeepSeek-V3",
+            "h200_sxm",
+            "vllm",
+            max_num_tokens=8192,
+            max_batch_size=256,
+            memory_fraction_kind="of_total",
+            memory_fraction_value=0.9,
+            tp_size=3,
+            moe_tp_size=1,
+            moe_ep_size=2,
+            gpu_memory_capacity_bytes_override=800 * _GIB,
+            allow_naive_fallback=True,
+        )
+
+
+def test_estimate_kv_cache_infers_an_omitted_moe_dimension():
+    # tp_size=4 with moe_tp_size=2 and no moe_ep_size is a valid MoE layout,
+    # because ModelConfig infers moe_ep_size=2 from the attention width. The
+    # estimator used to fill the omitted value with 1, which made that request
+    # a width mismatch; with the request-wide re-raise that mismatch became a
+    # terminal error where it previously reached the naive fallback.
+    out = memory.estimate_kv_cache(
+        "deepseek-ai/DeepSeek-V3",
+        "h200_sxm",
+        "vllm",
+        max_num_tokens=8192,
+        max_batch_size=256,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        tp_size=4,
+        moe_tp_size=2,
+        gpu_memory_capacity_bytes_override=800 * _GIB,
+        allow_naive_fallback=True,
+    )
+    # Inference happens before the fallback is considered, so the request stays
+    # native instead of raising the width mismatch the old default produced.
+    assert out["source"] == "native"
+
+
+def test_estimate_kv_cache_defaults_an_omitted_moe_pair_to_pure_tensor_parallelism():
+    # An omitted pair means pure tensor parallelism at the attention width. It
+    # cannot mean moe_tp_size=moe_ep_size=1: at tp_size=4 that breaks the
+    # engine's tp*dp*cp == moe_tp*moe_ep invariant, and the request-wide
+    # re-raise makes the mismatch terminal where it used to reach the naive
+    # fallback.
+    kwargs = dict(
+        max_num_tokens=8192,
+        max_batch_size=256,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        tp_size=4,
+        gpu_memory_capacity_bytes_override=800 * _GIB,
+        allow_naive_fallback=True,
+    )
+    omitted = memory.estimate_kv_cache("deepseek-ai/DeepSeek-V3", "h200_sxm", "vllm", **kwargs)
+    explicit = memory.estimate_kv_cache(
+        "deepseek-ai/DeepSeek-V3",
+        "h200_sxm",
+        "vllm",
+        moe_tp_size=4,
+        moe_ep_size=1,
+        **kwargs,
+    )
+    assert omitted["source"] == explicit["source"] == "native"
+    assert omitted["total_kv_size_tokens"] == explicit["total_kv_size_tokens"]
+
+
+def test_estimate_kv_cache_accepts_an_omitted_moe_pair_for_a_dense_checkpoint():
+    # Dense models never read the MoE dims, so resolving the pair must not turn
+    # an ordinary multi-GPU dense request into a MoE validation error.
+    out = memory.estimate_kv_cache(
+        "nvidia/Gemma-4-31B-IT-NVFP4",
+        "h200_sxm",
+        "vllm",
+        max_num_tokens=8192,
+        max_batch_size=256,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        tp_size=4,
+        gpu_memory_capacity_bytes_override=200 * _GIB,
+        allow_naive_fallback=False,
+    )
+    assert out["source"] == "native"
+
+
+def test_estimate_kv_cache_keeps_the_naive_fallback_for_a_valid_dense_gemma4_checkpoint(monkeypatch):
+    # The metadata gate must not turn the documented naive fallback into an
+    # error for a well-formed dense checkpoint whose database is unavailable.
+    from aisim_core.sdk import perf_database
+
+    def _missing_database(*args, **kwargs):
+        raise RuntimeError("perf DB not available")
+
+    monkeypatch.setattr(perf_database, "get_database", _missing_database)
+    monkeypatch.setattr(memory.NaiveKVCacheEstimator, "_load_config", lambda *a, **k: dict(_RAW_UNSUPPORTED))
+
+    out = memory.estimate_kv_cache(
+        "nvidia/Gemma-4-31B-IT-NVFP4",
+        "h200_sxm",
+        "vllm",
+        max_num_tokens=8192,
+        max_batch_size=256,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        gpu_memory_capacity_bytes_override=200 * _GIB,
+        allow_naive_fallback=True,
+    )
+    assert out["source"] == "naive_fallback"
+
+
+def _fallback_without_database(monkeypatch):
+    """Make the perf DB unavailable so `estimate_kv_cache` routes to the naive path."""
+    from aisim_core.sdk import perf_database
+
+    def _missing_database(*args, **kwargs):
+        raise RuntimeError("perf DB not available")
+
+    monkeypatch.setattr(perf_database, "get_database", _missing_database)
+
+
+def test_estimate_kv_cache_naive_fallback_prices_an_omitted_moe_pair_like_the_explicit_layout(monkeypatch):
+    # The fallback shards expert weights by moe_tp_size * moe_ep_size. It used
+    # to substitute 1 for both omitted dims while the native build resolved
+    # tp_size=4, so the same request produced a different capacity depending on
+    # which path ran. Both now resolve the pair to pure tensor parallelism.
+    _fallback_without_database(monkeypatch)
+    kwargs = dict(
+        max_num_tokens=8192,
+        max_batch_size=256,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        tp_size=4,
+        gpu_memory_capacity_bytes_override=800 * _GIB,
+        allow_naive_fallback=True,
+    )
+    omitted = memory.estimate_kv_cache("deepseek-ai/DeepSeek-V3", "h200_sxm", "vllm", **kwargs)
+    explicit = memory.estimate_kv_cache(
+        "deepseek-ai/DeepSeek-V3",
+        "h200_sxm",
+        "vllm",
+        moe_tp_size=4,
+        moe_ep_size=1,
+        **kwargs,
+    )
+    assert omitted["source"] == explicit["source"] == "naive_fallback"
+    assert omitted["total_kv_size_tokens"] == explicit["total_kv_size_tokens"]
+
+
+def test_estimate_kv_cache_naive_fallback_infers_a_single_omitted_moe_dimension(monkeypatch):
+    # tp_size=4 with moe_tp_size=2 and no moe_ep_size is the same layout as the
+    # explicit (2, 2) pair. The fallback must infer it from the attention width
+    # instead of defaulting the omitted value to 1.
+    _fallback_without_database(monkeypatch)
+    kwargs = dict(
+        max_num_tokens=8192,
+        max_batch_size=256,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        tp_size=4,
+        gpu_memory_capacity_bytes_override=800 * _GIB,
+        allow_naive_fallback=True,
+    )
+    inferred = memory.estimate_kv_cache("deepseek-ai/DeepSeek-V3", "h200_sxm", "vllm", moe_tp_size=2, **kwargs)
+    explicit = memory.estimate_kv_cache(
+        "deepseek-ai/DeepSeek-V3",
+        "h200_sxm",
+        "vllm",
+        moe_tp_size=2,
+        moe_ep_size=2,
+        **kwargs,
+    )
+    assert inferred["source"] == explicit["source"] == "naive_fallback"
+    assert inferred["total_kv_size_tokens"] == explicit["total_kv_size_tokens"]
+
+
+def test_estimate_kv_cache_rejects_a_moe_width_mismatch_before_the_database(monkeypatch):
+    # A routed layout whose width contradicts the attention width must raise
+    # before the perf-DB lookup. Otherwise an unavailable database plus
+    # allow_naive_fallback=True would price a topology the engine rejects.
+    from aisim_core.sdk import perf_database
+
+    def _unreachable(*args, **kwargs):
+        pytest.fail("an invalid MoE layout must be rejected before the database lookup")
+
+    monkeypatch.setattr(perf_database, "get_database", _unreachable)
+    monkeypatch.setattr(
+        memory.NaiveKVCacheEstimator,
+        "from_model_path",
+        classmethod(lambda *args, **kwargs: pytest.fail("naive fallback must not price an unsupported config")),
+    )
+    with pytest.raises(InvalidEngineConfigurationError, match="Parallelism width mismatch"):
+        memory.estimate_kv_cache(
+            "deepseek-ai/DeepSeek-V3",
+            "h200_sxm",
+            "vllm",
+            max_num_tokens=8192,
+            max_batch_size=256,
+            memory_fraction_kind="of_total",
+            memory_fraction_value=0.9,
+            tp_size=4,
+            moe_tp_size=1,
+            moe_ep_size=1,
+            gpu_memory_capacity_bytes_override=800 * _GIB,
+            allow_naive_fallback=True,
+        )
+
+
+def test_estimate_kv_cache_rejects_dense_gemma4_moe_ep_before_the_database(monkeypatch):
+    # Gemma4MixModel rejects an explicit moe_ep_size>1 for a dense checkpoint,
+    # but that build runs after the perf-DB lookup. Without a pre-database
+    # check, a missing database plus allow_naive_fallback=True would let the
+    # naive estimator accept the same configuration and return a capacity.
+    from aisim_core.sdk import perf_database
+
+    def _unreachable(*args, **kwargs):
+        pytest.fail("dense Gemma 4 with moe_ep_size>1 must be rejected before the database lookup")
+
+    monkeypatch.setattr(perf_database, "get_database", _unreachable)
+    monkeypatch.setattr(
+        memory.NaiveKVCacheEstimator,
+        "from_model_path",
+        classmethod(lambda *args, **kwargs: pytest.fail("naive fallback must not price an unsupported config")),
+    )
+    with pytest.raises(InvalidEngineConfigurationError, match="dense Gemma 4 variants require moe_ep_size=1, got 2"):
+        memory.estimate_kv_cache(
+            "nvidia/Gemma-4-31B-IT-NVFP4",
+            "h200_sxm",
+            "vllm",
+            max_num_tokens=8192,
+            max_batch_size=256,
+            memory_fraction_kind="of_total",
+            memory_fraction_value=0.9,
+            gpu_memory_capacity_bytes_override=200 * _GIB,
+            moe_ep_size=2,
+            allow_naive_fallback=True,
+        )
 
 
 def test_estimate_kv_cache_propagates_when_fallback_disabled(monkeypatch):
@@ -1680,7 +2044,7 @@ def test_calc_vllm_swa_batch_cap_aligns_max_model_len_before_spreading_reservati
     aligned_len = 1024
     assert aligned_len % block_size == 0
     assert swa_seq_tokens < aligned_len
-    aligned = models.calc_vllm_swa_batch_cap(
+    aligned = calc_vllm_swa_batch_cap(
         window_size,
         max_batched,
         aligned_len,
@@ -1695,7 +2059,7 @@ def test_calc_vllm_swa_batch_cap_aligns_max_model_len_before_spreading_reservati
     assert unaligned_len % block_size != 0
     assert swa_seq_tokens < unaligned_len
     aligned_up = math.ceil(unaligned_len / block_size) * block_size
-    got = models.calc_vllm_swa_batch_cap(
+    got = calc_vllm_swa_batch_cap(
         window_size,
         max_batched,
         unaligned_len,
@@ -1793,7 +2157,7 @@ def test_vllm_swa_capacity_uses_context_length_through_native_build(monkeypatch)
     assert block_size == 16
     assert max_batched == common["max_num_tokens"]
 
-    expected = models.calc_vllm_swa_batch_cap(
+    expected = calc_vllm_swa_batch_cap(
         model._GPTOSS_WINDOW_SIZE,
         max_batched,
         context_length,

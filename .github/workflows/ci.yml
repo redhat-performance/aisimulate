@@ -449,6 +449,7 @@ jobs:
       - name: Test with Python embedding enabled
         run: |
           export AIC_REQUIRE_EMBEDDED_ROUND_TRIP=1
+          export AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1
           export PYO3_PYTHON="${pythonLocation}/bin/python"
           cargo test --workspace --features embed-python,replay-bench
 

@@ -146,6 +146,7 @@ pub struct KvCacheEstimateAdjusted {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum KvCacheEstimateError {
+    /// Native estimation is unavailable; callers may consider a fallback.
     Unsupported {
         model: String,
         backend: BackendKind,
@@ -163,6 +164,7 @@ pub enum KvCacheEstimateError {
         backend: BackendKind,
         variant_kind: &'static str,
     },
+    /// Invalid caller controls or checkpoint metadata. Must not trigger fallback.
     BadConfig {
         field: String,
         reason: String,
@@ -229,11 +231,13 @@ impl std::error::Error for KvCacheEstimateError {}
 /// Rust side rebuilds a [`KvCacheEstimate`] from the returned dict with no math
 /// of its own.
 ///
-/// Errors from the Python side (unsupported model/backend, incompatible memory
-/// fraction, out-of-range tolerance, no KV budget, HF config fetch failure) cross
-/// the PyO3 boundary as a `ValueError` whose message carries the failure detail
-/// and are surfaced here as [`KvCacheEstimateError::Unsupported`] with that
-/// message.
+/// Python `InvalidEngineConfigurationError` rejections are surfaced as
+/// [`KvCacheEstimateError::BadConfig`] for the `engine` field, so callers must
+/// not retry them with a fallback estimator. Other Python errors (unsupported
+/// model/backend, incompatible memory fraction, out-of-range tolerance, no KV
+/// budget, HF config fetch failure) retain the historical
+/// [`KvCacheEstimateError::Unsupported`] mapping. Both retain the Python
+/// diagnostic.
 #[cfg(feature = "python")]
 pub fn estimate_kv_cache(
     req: KvCacheEstimateRequest,
@@ -278,14 +282,28 @@ fn fetch_python_estimate(
         estimate_from_dict(&out)
     })
     // PyErr → KvCacheEstimateError inline (keeps the error enum self-contained).
-    // The Python side raises a ValueError whose message already carries the
-    // specific failure detail; surface it as Unsupported so the (deferred)
-    // Mocker fallback decision still keys on the same variant it did before.
-    .map_err(|e| KvCacheEstimateError::Unsupported {
-        model: engine.model_name.clone(),
-        backend: engine.backend.clone(),
-        gpu_sku: engine.system_name.clone(),
-        reason: format!("estimate_kv_cache: {e}"),
+    // Keep hard configuration rejections distinct from Unsupported, the variant
+    // external callers can use to decide whether to try a fallback estimator.
+    .map_err(|error| {
+        let invalid = Python::attach(|py| {
+            py.import("aisim_core.sdk.errors")
+                .and_then(|module| module.getattr("InvalidEngineConfigurationError"))
+                .is_ok_and(|kind| error.is_instance(py, &kind))
+        });
+        let reason = format!("estimate_kv_cache: {error}");
+        if invalid {
+            KvCacheEstimateError::BadConfig {
+                field: "engine".into(),
+                reason,
+            }
+        } else {
+            KvCacheEstimateError::Unsupported {
+                model: engine.model_name.clone(),
+                backend: engine.backend.clone(),
+                gpu_sku: engine.system_name.clone(),
+                reason,
+            }
+        }
     })
 }
 
